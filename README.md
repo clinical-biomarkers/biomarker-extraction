@@ -3,9 +3,11 @@ Raw data extraction and transformation scripts
 
 ---
 
-## Downloads
+## caDSR
 
-### Permissible Values via Browser Export (Recommended)
+### Downloads
+
+#### Permissible Values via Browser Export (Recommended)
 
 The caDSR OneData UI at `cadsr.cancer.gov/onedata` offers an "Export to Excel" option under each data element's Permissible Values tab. The downloaded file (`od_001.xls`) contains the following columns:
 
@@ -30,25 +32,16 @@ The export requires an active browser session and cannot be replicated with `wge
 5. For bulk download go to "Delivery Options" and select "Export to Excel"
    <img width="1960" height="912" alt="3" src="https://github.com/user-attachments/assets/1501a860-001d-4fe7-93e8-95cb65227629" />
 
-### Permissible Values via caDSR API (to be reviewed)
+The downloaded sheet can be found in `downloads/cadsr/od_001.xls` on the BiomarkerKB dev server. The downloads folder is not git tracked.
 
-The instructions below are incorrect, more research is needed to determine the correct API endpoint.
+#### Permissible Values via caDSR API (TBA)
 
-The caDSR API provides programmatic access to permissible values without requiring a browser session. Use the `/DataElement/{publicId}` endpoint with an explicit `Accept: application/json` header — without it, the server returns HTML.
+More research is needed to determine the correct API endpoint.
 
-```bash
-curl -s -H "Accept: application/json" \
-  "https://cadsrapi.cancer.gov/rad/NCIAPI.v1_0:NciApiRad/DataElement/5473?version=14" \
-  -o de_5473.json
-```
+### Generated files
+Location: `generated/cadsr`
 
-Permissible values are nested under `DataElement.ValueDomain.PermissibleValues` in the response. The full response also includes `ClassificationSchemes`, `AlternateNames`, and `ReferenceDocuments`, which appear before and after the permissible values in the JSON.
-
-To extract and count permissible values:
-
-```bash
-jq '{count: (.DataElement.ValueDomain.PermissibleValues | length), first: .DataElement.ValueDomain.PermissibleValues[0]}' de_5473.json
-```
+`cadsr.tsv` is a manually curated selection of rows from `od_001.xls`.
 
 ---
 
