@@ -45,3 +45,9 @@ Location: `generated/cadsr`
 
 ---
 
+## SalivaDB
+### Download
+```bash
+cd scripts/salivadb
+./download_salivadb.sh -d path/to/download/dir
+```
