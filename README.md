@@ -45,6 +45,22 @@ Location: `generated/cadsr`
 
 ---
 
+## CarboCurator
+### Download
+Cyrus's data: 
+
+https://github.com/clinical-biomarkers/carbocurator-data/
+
+https://github.com/clinical-biomarkers/bGSL-data/
+
+The data files live in these repositories and present the point of truth for this data:
+
+https://github.com/clinical-biomarkers/carbocurator-data/blob/main/releases/2026-10-08/biomarkers_llm_glycan_2026-10-08.tsv 
+
+https://github.com/clinical-biomarkers/bGSL-data/blob/main/releases/2026-10-08/bGSL_2026-10-08.tsv 
+
+---
+
 ## SalivaDB
 ### Download
 ```bash
