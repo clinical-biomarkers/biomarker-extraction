@@ -14,6 +14,7 @@ def convert_node(node: dict) -> dict | None:
         return None
     return {
         "id": node_id,
+        "iri": node.get("iri"),
         "label": node["label"],
         "metadata": node["metadata"],
         "children": [c for c in (convert_node(ch) for ch in node.get("children", [])) if c is not None]
