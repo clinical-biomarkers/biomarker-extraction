@@ -24,26 +24,17 @@ import requests
 # ---------------------------------------------------------------------------
 
 BASE_DIR = Path("/data/shared/repos/extraction")
-INPUT_DIR = BASE_DIR / "downloads/salivadb"
-MAPPING_DIR = BASE_DIR / "downloads/mapping_files"
-OUTPUT_DIR = BASE_DIR / "generated/salivadb"
-LOG_DIR = BASE_DIR / "logs"
-
-OUTPUT_FILE = OUTPUT_DIR / "biomarkers_salivadb.tsv"
+DEFAULT_INPUT_DIR = BASE_DIR / "downloads/salivadb"
+DEFAULT_MAPPING_DIR = BASE_DIR / "downloads/mapping_files"
+DEFAULT_OUTPUT_FILE = BASE_DIR / "generated/salivadb/biomarkers_salivadb.tsv"
+DEFAULT_LOG_DIR = BASE_DIR / "logs"
 
 HGNC_URL = (
     "https://storage.googleapis.com/public-download-files/hgnc/tsv/tsv/hgnc_complete_set.txt"
 )
-HGNC_FILE = MAPPING_DIR / "hgnc_complete_set.txt"
-
-NCBI_URL = "https://ftp.ncbi.nlm.nih.gov/gene/DATA/gene_info.gz"
-NCBI_FILE = MAPPING_DIR / "gene_info.gz"
 
 DOID_URL = "https://raw.githubusercontent.com/DiseaseOntology/HumanDiseaseOntology/main/src/ontology/doid.obo"
-DOID_FILE = MAPPING_DIR / "doid.obo"
-
 MIRBASE_URL = "https://mirbase.org/download/CURRENT/id_mapping.tsv"
-MIRBASE_FILE = MAPPING_DIR / "mirbase_id_mapping.tsv"
 
 OLS_API = "https://www.ebi.ac.uk/ols4/api/search"
 PUBMED_API = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
@@ -100,22 +91,24 @@ GENE_FUSION_PATTERN = re.compile(
 )
 
 # ---------------------------------------------------------------------------
-# Logging setup
+# Logging — configured in main() once the log directory is known
 # ---------------------------------------------------------------------------
 
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-_log_file = LOG_DIR / f"generate_salivadb_{_timestamp}.log"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler(_log_file),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
 logger = logging.getLogger(__name__)
+
+
+def setup_logging(log_dir: Path) -> None:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"generate_salivadb_{timestamp}.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
 
 
 # ===========================================================================
@@ -144,63 +137,38 @@ def download_if_missing(url: str, dest: Path, decompress_gz: bool = False) -> No
         raise
 
 
-def load_hgnc() -> dict[str, str]:
+def load_hgnc(hgnc_file: Path) -> dict[str, str]:
     """Return {symbol → 'HGNC:<id>'} from the HGNC complete set."""
-    download_if_missing(HGNC_URL, HGNC_FILE)
-    logger.info("Loading HGNC mapping from %s", HGNC_FILE)
-    df = pd.read_csv(HGNC_FILE, sep="\t", dtype=str, low_memory=False)
-    mapping: dict[str, str] = {}
-    for _, row in df.iterrows():
-        sym = str(row.get("symbol", "")).strip()
-        hgnc_id = str(row.get("hgnc_id", "")).strip()
-        if sym and hgnc_id and hgnc_id.lower() != "nan":
-            mapping[sym.upper()] = hgnc_id  # hgnc_id already "HGNC:XXXX"
+    download_if_missing(HGNC_URL, hgnc_file)
+    logger.info("Loading HGNC mapping from %s", hgnc_file)
+    df = pd.read_csv(
+        hgnc_file,
+        sep="\t",
+        dtype=str,
+        low_memory=False,
+        usecols=["hgnc_id", "symbol"],
+    )
+    df = df.dropna(subset=["hgnc_id", "symbol"])
+    mapping = dict(zip(df["symbol"].str.strip().str.upper(), df["hgnc_id"].str.strip()))
     logger.info("HGNC: loaded %d symbol→ID entries", len(mapping))
     return mapping
 
 
-def load_ncbi_gene() -> dict[str, str]:
-    """Return {symbol → 'NCBI:<gene_id>'} from NCBI gene_info (Homo sapiens only)."""
-    download_if_missing(NCBI_URL, NCBI_FILE, decompress_gz=True)
-    logger.info("Loading NCBI gene mapping from %s", NCBI_FILE)
-    df = pd.read_csv(
-        NCBI_FILE,
-        sep="\t",
-        dtype=str,
-        low_memory=False,
-    )
-    # gene_info has a '#tax_id' column; keep only human (9606)
-    tax_col = df.columns[0]
-    human = df[df[tax_col] == "9606"]
-    mapping: dict[str, str] = {}
-    for _, row in human.iterrows():
-        sym = str(row.get("Symbol", "")).strip()
-        gene_id = str(row.get("GeneID", "")).strip()
-        if sym and gene_id and gene_id.lower() != "nan":
-            mapping[sym.upper()] = f"NCBI:{gene_id}"
-        # Also add synonyms
-        for syn in str(row.get("Synonyms", "")).split("|"):
-            syn = syn.strip()
-            if syn and syn != "-":
-                mapping.setdefault(syn.upper(), f"NCBI:{gene_id}")
-    logger.info("NCBI: loaded %d symbol→ID entries", len(mapping))
-    return mapping
 
-
-def load_doid() -> dict[str, str]:
+def load_doid(doid_file: Path) -> dict[str, str]:
     """
     Parse doid.obo and return {lowercase_name → 'DOID:XXXXXXX'}.
     Also maps synonyms.
     """
-    download_if_missing(DOID_URL, DOID_FILE)
-    logger.info("Parsing DOID OBO from %s", DOID_FILE)
+    download_if_missing(DOID_URL, doid_file)
+    logger.info("Parsing DOID OBO from %s", doid_file)
     name_to_id: dict[str, str] = {}
     current_id: Optional[str] = None
     current_name: Optional[str] = None
     synonyms: list[str] = []
     is_obsolete = False
 
-    with open(DOID_FILE, encoding="utf-8") as fh:
+    with open(doid_file, encoding="utf-8") as fh:
         for line in fh:
             line = line.rstrip()
             if line == "[Term]":
@@ -231,12 +199,12 @@ def load_doid() -> dict[str, str]:
     return name_to_id
 
 
-def load_mirbase() -> dict[str, str]:
+def load_mirbase(mirbase_file: Path) -> dict[str, str]:
     """Return {mature_id_or_stem_loop_name → 'MRB:<accession>'}."""
-    download_if_missing(MIRBASE_URL, MIRBASE_FILE)
-    logger.info("Loading miRBase mapping from %s", MIRBASE_FILE)
+    download_if_missing(MIRBASE_URL, mirbase_file)
+    logger.info("Loading miRBase mapping from %s", mirbase_file)
     # id_mapping.tsv columns: accession, name, type, mature/hairpin flag
-    df = pd.read_csv(MIRBASE_FILE, sep="\t", header=None, dtype=str)
+    df = pd.read_csv(mirbase_file, sep="\t", header=None, dtype=str)
     mapping: dict[str, str] = {}
     for _, row in df.iterrows():
         acc = str(row.iloc[0]).strip()
@@ -252,17 +220,11 @@ def load_mirbase() -> dict[str, str]:
 # ===========================================================================
 
 
-def map_gene_symbol(
-    symbol: str,
-    hgnc: dict[str, str],
-    ncbi: dict[str, str],
-) -> str:
-    """Map a gene symbol to HGNC or NCBI ID; return empty string if not found."""
+def map_gene_symbol(symbol: str, hgnc: dict[str, str]) -> str:
+    """Map a gene symbol to an HGNC ID; return empty string if not found."""
     key = symbol.strip().upper()
     if key in hgnc:
         return hgnc[key]
-    if key in ncbi:
-        return ncbi[key]
     logger.warning("Gene symbol not mapped: %s", symbol)
     return ""
 
@@ -418,7 +380,7 @@ def map_specimen(raw: str) -> str:
     if s in SPECIMEN_MAP:
         return SPECIMEN_MAP[s]
     # any string where the last word is "saliva"
-    if s.split()[-1] == "saliva":
+    if s.split() and s.split()[-1] == "saliva":
         return "saliva"
     return s
 
@@ -472,7 +434,6 @@ def build_biomarker_controlled_vocab(
 def process_gene(
     df: pd.DataFrame,
     hgnc: dict[str, str],
-    ncbi: dict[str, str],
     doid: dict[str, str],
 ) -> pd.DataFrame:
     logger.info("Processing gene.tsv (%d rows before filtering)", len(df))
@@ -528,14 +489,14 @@ def process_gene(
                 gene_a_sym = raw_id[:mid]
                 gene_b_raw = raw_id[mid:]
 
-            id_a = map_gene_symbol(gene_a_sym, hgnc, ncbi)
-            id_b = map_gene_symbol(gene_b_raw, hgnc, ncbi)
+            id_a = map_gene_symbol(gene_a_sym, hgnc)
+            id_b = map_gene_symbol(gene_b_raw, hgnc)
             gene_names = [gene_a_sym, gene_b_raw]
             gene_ids = [id_a, id_b]
             entity_indices = [1, 2]
         else:
             gene_names = [base_name]
-            gene_ids = [map_gene_symbol(raw_id, hgnc, ncbi)]
+            gene_ids = [map_gene_symbol(raw_id, hgnc)]
             entity_indices = [1]
 
         for role in split_biomarker_role(str(src.get("Biomarker_Type", ""))):
@@ -791,52 +752,53 @@ def main() -> None:
     parser.add_argument(
         "--input-dir",
         type=Path,
-        default=INPUT_DIR,
-        help=f"Directory containing the four source TSVs (default: {INPUT_DIR})",
+        default=DEFAULT_INPUT_DIR,
+        help=f"Directory containing the four source TSVs (default: {DEFAULT_INPUT_DIR})",
     )
     parser.add_argument(
         "--output-file",
         type=Path,
-        default=OUTPUT_FILE,
-        help=f"Path for the output TSV (default: {OUTPUT_FILE})",
+        default=DEFAULT_OUTPUT_FILE,
+        help=f"Path for the output TSV (default: {DEFAULT_OUTPUT_FILE})",
     )
     parser.add_argument(
         "--mapping-dir",
         type=Path,
-        default=MAPPING_DIR,
-        help=f"Directory for mapping files (default: {MAPPING_DIR})",
+        default=DEFAULT_MAPPING_DIR,
+        help=f"Directory for mapping files (default: {DEFAULT_MAPPING_DIR})",
+    )
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=DEFAULT_LOG_DIR,
+        help=f"Directory for log files (default: {DEFAULT_LOG_DIR})",
     )
     args = parser.parse_args()
 
-    # Allow CLI overrides to propagate to module-level globals used by loaders
-    global INPUT_DIR, OUTPUT_FILE, MAPPING_DIR
-    global HGNC_FILE, NCBI_FILE, DOID_FILE, MIRBASE_FILE
-    INPUT_DIR = args.input_dir
-    OUTPUT_FILE = args.output_file
-    MAPPING_DIR = args.mapping_dir
-    HGNC_FILE = MAPPING_DIR / "hgnc_complete_set.txt"
-    NCBI_FILE = MAPPING_DIR / "gene_info.gz"
-    DOID_FILE = MAPPING_DIR / "doid.obo"
-    MIRBASE_FILE = MAPPING_DIR / "mirbase_id_mapping.tsv"
+    setup_logging(args.log_dir)
+
+    # Derive mapping file paths from the mapping directory
+    hgnc_file = args.mapping_dir / "hgnc_complete_set.txt"
+    doid_file = args.mapping_dir / "doid.obo"
+    mirbase_file = args.mapping_dir / "mirbase_id_mapping.tsv"
 
     logger.info("=== SalivaDB extraction started ===")
-    logger.info("Input directory : %s", INPUT_DIR)
-    logger.info("Output file     : %s", OUTPUT_FILE)
-    logger.info("Mapping dir     : %s", MAPPING_DIR)
+    logger.info("Input directory : %s", args.input_dir)
+    logger.info("Output file     : %s", args.output_file)
+    logger.info("Mapping dir     : %s", args.mapping_dir)
 
     # ------------------------------------------------------------------
     # Load mapping tables
     # ------------------------------------------------------------------
-    hgnc = load_hgnc()
-    ncbi = load_ncbi_gene()
-    doid = load_doid()
-    mirbase = load_mirbase()
+    hgnc = load_hgnc(hgnc_file)
+    doid = load_doid(doid_file)
+    mirbase = load_mirbase(mirbase_file)
 
     # ------------------------------------------------------------------
     # Load source files
     # ------------------------------------------------------------------
     def read_tsv(name: str) -> pd.DataFrame:
-        path = INPUT_DIR / name
+        path = args.input_dir / name
         logger.info("Reading %s", path)
         return pd.read_csv(path, sep="\t", dtype=str).fillna("")
 
@@ -849,7 +811,7 @@ def main() -> None:
     # Process each source
     # ------------------------------------------------------------------
     frames = [
-        process_gene(gene_df, hgnc, ncbi, doid),
+        process_gene(gene_df, hgnc, doid),
         process_metabolite(metabolite_df, doid),
         process_mirna(mirna_df, mirbase, doid),
         process_protein(protein_df, doid),
@@ -861,9 +823,9 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Write output
     # ------------------------------------------------------------------
-    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    result.to_csv(OUTPUT_FILE, sep="\t", index=False)
-    logger.info("Output written to %s", OUTPUT_FILE)
+    args.output_file.parent.mkdir(parents=True, exist_ok=True)
+    result.to_csv(args.output_file, sep="\t", index=False)
+    logger.info("Output written to %s", args.output_file)
     logger.info("=== SalivaDB extraction complete ===")
 
 
