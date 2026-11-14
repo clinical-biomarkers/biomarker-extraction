@@ -1,8 +1,3 @@
-"""
-generate_salivadb.py
-Generate the SalivaDB biomarkers dataset from downloaded TSV files.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -11,12 +6,16 @@ import gzip
 import io
 import json
 import logging
+import os
 import re
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+from dotenv import load_dotenv
+
 from scripts.utils.log_utils import setup_logging
 
 import pandas as pd
@@ -27,6 +26,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Paths / constants
 # ---------------------------------------------------------------------------
+
+load_dotenv(Path(__file__).parents[2] / ".env")
 
 BASE_DIR = Path("/data/shared/repos/extraction")
 DEFAULT_INPUT_DIR = BASE_DIR / "downloads/salivadb"
@@ -42,6 +43,7 @@ HGNC_URL = (
 DOID_URL = "https://raw.githubusercontent.com/DiseaseOntology/HumanDiseaseOntology/main/src/ontology/doid.obo"
 MIRBASE_URL = "https://mirbase.org/download/CURRENT/id_mapping.tsv"
 
+NCBI_API_KEY = os.environ.get("NCBI_API_KEY", "")
 OLS_API = "https://www.ebi.ac.uk/ols4/api/search"
 PUBMED_API = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 
@@ -441,12 +443,13 @@ def _ols_lookup(condition: str) -> str:
     return ""
 
 
-def map_pubmed_via_api(author_string: str, year: Optional[str]) -> str:
+def map_pubmed_via_api(author_string: str, year: Optional[str], api_key: str = NCBI_API_KEY) -> str:
     """
     Given an author string (e.g. "Sugimoto., Masahiro et al.") and an optional
     year, attempt to look up the PMID via the NCBI ESearch API.
     Returns 'PubMed:<pmid>' or the original *author_string* on failure.
     """
+    time.sleep(0.11)  # 10 req/sec with API key
     query = author_string
     if year and str(year).strip().isdigit():
         query += f"[Author] AND {year.strip()}[PDAT]"
@@ -460,6 +463,7 @@ def map_pubmed_via_api(author_string: str, year: Optional[str]) -> str:
                 "term": query,
                 "retmode": "json",
                 "retmax": 1,
+                "api_key": api_key,
             },
             timeout=30,
         )

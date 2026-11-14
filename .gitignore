@@ -3,6 +3,7 @@ downloads/*
 downloads/mapping_files/*
 !downloads/mapping_files/curated_condition_mappings.json
 env/
+.env
 generated/
 logs/
 nohup.out

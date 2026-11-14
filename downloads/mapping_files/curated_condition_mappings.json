@@ -444,6 +444,36 @@
         "condition": "breast neoplasm",
         "condition_id": "MONDO:0021100"
       }
+    ],
+    "sjšgren syndrome": [
+      {
+        "condition": "sjogren's syndrome",
+        "condition_id": "DOID:12894"
+      }
+    ],
+    "type ii diabetes": [
+      {
+        "condition": "type 2 diabetes mellitus",
+        "condition_id": "DOID:9352"
+      }
+    ],
+    "alzheimerõs disease": [
+      {
+        "condition": "alzheimer's disease",
+        "condition_id": "DOID:10652"
+      }
+    ],
+    "parkinsonõs disease": [
+      {
+        "condition": "parkinson's disease",
+        "condition_id": "DOID:14330"
+      }
+    ],
+    "huntingtonõs disease": [
+      {
+        "condition": "huntington's disease",
+        "condition_id": "DOID:12858"
+      }
     ]
   }
 }
