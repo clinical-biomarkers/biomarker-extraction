@@ -22,6 +22,8 @@ from scripts.utils.log_utils import setup_logging
 import pandas as pd
 import requests
 
+logger = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
 # Paths / constants
 # ---------------------------------------------------------------------------
