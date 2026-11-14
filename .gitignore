@@ -6,3 +6,4 @@ env/
 generated/
 logs/
 nohup.out
+__pycache__/

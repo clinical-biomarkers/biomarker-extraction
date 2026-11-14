@@ -46,7 +46,6 @@ class DeduplicatingFilter(logging.Filter):
         self._seen.add(msg)
         return True
 
-
 def setup_logging(log_dir: Path, script_stem: str = "generate_salivadb") -> None:
     """
     Configure root-level logging to a timestamped file and stdout,
@@ -63,12 +62,17 @@ def setup_logging(log_dir: Path, script_stem: str = "generate_salivadb") -> None
     log_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = log_dir / f"{script_stem}_{timestamp}.log"
+
+    dedup = DeduplicatingFilter()
+
+    file_handler = logging.FileHandler(log_file)
+    file_handler.addFilter(dedup)
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.addFilter(dedup)
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler(sys.stdout),
-        ],
+        handlers=[file_handler, stream_handler],
     )
-    logging.getLogger().addFilter(DeduplicatingFilter())
