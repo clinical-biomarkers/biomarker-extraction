@@ -6,15 +6,11 @@ import gzip
 import io
 import json
 import logging
-import os
 import re
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-
-from dotenv import load_dotenv
 
 from scripts.utils.log_utils import setup_logging
 
@@ -26,8 +22,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Paths / constants
 # ---------------------------------------------------------------------------
-
-load_dotenv(Path(__file__).parents[2] / ".env")
 
 BASE_DIR = Path("/data/shared/repos/extraction")
 DEFAULT_INPUT_DIR = BASE_DIR / "downloads/salivadb"
@@ -43,9 +37,7 @@ HGNC_URL = (
 DOID_URL = "https://raw.githubusercontent.com/DiseaseOntology/HumanDiseaseOntology/main/src/ontology/doid.obo"
 MIRBASE_URL = "https://mirbase.org/download/CURRENT/id_mapping.tsv"
 
-NCBI_API_KEY = os.environ.get("NCBI_API_KEY", "")
 OLS_API = "https://www.ebi.ac.uk/ols4/api/search"
-PUBMED_API = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 
 OUTPUT_COLUMNS = [
     "biomarker_index",
@@ -443,46 +435,6 @@ def _ols_lookup(condition: str) -> str:
     return ""
 
 
-def map_pubmed_via_api(author_string: str, year: Optional[str], api_key: str = NCBI_API_KEY) -> str:
-    """
-    Given an author string (e.g. "Sugimoto., Masahiro et al.") and an optional
-    year, attempt to look up the PMID via the NCBI ESearch API.
-    Returns 'PubMed:<pmid>' or the original *author_string* on failure.
-    """
-    time.sleep(0.11)  # 10 req/sec with API key
-    query = author_string
-    if year and str(year).strip().isdigit():
-        query += f"[Author] AND {year.strip()}[PDAT]"
-    else:
-        query += "[Author]"
-    try:
-        resp = requests.get(
-            PUBMED_API,
-            params={
-                "db": "pubmed",
-                "term": query,
-                "retmode": "json",
-                "retmax": 1,
-                "api_key": api_key,
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        ids = data.get("esearchresult", {}).get("idlist", [])
-        if ids:
-            pmid = ids[0]
-            logger.info("PubMed resolved '%s' (%s) → %s", author_string, year, pmid)
-            return f"PubMed:{pmid}"
-        logger.warning(
-            "PubMed: could not resolve '%s' (year=%s); keeping raw string",
-            author_string,
-            year,
-        )
-    except requests.RequestException:
-        logger.exception("PubMed API error for '%s'", author_string)
-    return author_string
-
 
 def map_mirna_id(
     mirna_id: str,
@@ -550,14 +502,16 @@ def map_change_type(raw: str) -> str:
     return CHANGE_TYPE_MAP.get(s, s)
 
 
-def parse_evidence_source(pmid_val: str, year_val: Optional[str]) -> str:
+def parse_evidence_source(pmid_val: str) -> Optional[str]:
     """
-    Return 'PubMed:<id>' for numeric PMIDs; resolve author strings via API.
+    Return 'PubMed:<id>' for numeric PMIDs; return None for non-numeric values.
+    Rows with a None evidence_source are excluded by callers.
     """
     val = str(pmid_val).replace('"', "").strip()
     if val.isdigit():
         return f"PubMed:{val}"
-    return map_pubmed_via_api(val, year_val)
+    logger.info("Skipping row: non-numeric PMID '%s'", val)
+    return None
 
 
 def split_biomarker_role(raw: str) -> list[str]:
@@ -631,9 +585,9 @@ def process_gene(
 
         specimen = map_specimen(str(src.get("Collection_site", "")))
         specimen_id = SPECIMEN_ID_MAP.get(specimen, "")
-        evidence_source = parse_evidence_source(
-            str(src.get("PMID", "")), str(src.get("Year_of_Publication", ""))
-        )
+        evidence_source = parse_evidence_source(str(src.get("PMID", "")))
+        if evidence_source is None:
+            continue
         entity_type = str(src.get("Biomarker", "")).strip().lower()
         base_name = clean_biomarker_name(str(src["Biomarker_Name"]))
 
@@ -723,9 +677,9 @@ def process_metabolite(
 
         specimen = map_specimen(str(src.get("Collection_site", "")))
         specimen_id = SPECIMEN_ID_MAP.get(specimen, "")
-        evidence_source = parse_evidence_source(
-            str(src.get("PMID", "")), str(src.get("Year_of_Publication", ""))
-        )
+        evidence_source = parse_evidence_source(str(src.get("PMID", "")))
+        if evidence_source is None:
+            continue
         entity_type = str(src.get("Biomarker", "")).strip().lower()
         entity_name = clean_biomarker_name(str(src["Biomarker_Name"]))
         change_type = map_change_type(str(src.get("Regulation", "")))
@@ -800,9 +754,9 @@ def process_mirna(
 
         specimen = map_specimen(str(src.get("Collection_site", "")))
         specimen_id = SPECIMEN_ID_MAP.get(specimen, "")
-        evidence_source = parse_evidence_source(
-            str(src.get("PMID", "")), str(src.get("Year_of_Publication", ""))
-        )
+        evidence_source = parse_evidence_source(str(src.get("PMID", "")))
+        if evidence_source is None:
+            continue
         entity_type = str(src.get("Biomarker", "")).strip()  # keep "miRNA" as-is
         entity_name = clean_biomarker_name(str(src["Biomarker_Name"]))
         change_type = map_change_type(str(src.get("Regulation", "")))
@@ -871,9 +825,9 @@ def process_protein(
 
         specimen = map_specimen(str(src.get("Collection_site", "")))
         specimen_id = SPECIMEN_ID_MAP.get(specimen, "")
-        evidence_source = parse_evidence_source(
-            str(src.get("PMID", "")), str(src.get("Year_of_Publication", ""))
-        )
+        evidence_source = parse_evidence_source(str(src.get("PMID", "")))
+        if evidence_source is None:
+            continue
         entity_type = str(src.get("Biomarker", "")).strip().lower()
         entity_name = clean_protein_name(str(src["Biomarker_Name"]))
         change_type = map_change_type(str(src.get("Regulation", "")))
