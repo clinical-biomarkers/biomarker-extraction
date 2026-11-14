@@ -17,6 +17,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from scripts.utils.log_utils import setup_logging
 
 import pandas as pd
 import requests
@@ -92,27 +93,6 @@ CHANGE_TYPE_MAP = {
 GENE_FUSION_PATTERN = re.compile(
     r"^[A-Za-z]{3,}[0-9][A-Za-z]{3,}[0-9](\s+\S+)?$"
 )
-
-# ---------------------------------------------------------------------------
-# Logging — configured in main() once the log directory is known
-# ---------------------------------------------------------------------------
-
-logger = logging.getLogger(__name__)
-
-
-def setup_logging(log_dir: Path) -> None:
-    log_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"generate_salivadb_{timestamp}.log"
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler(sys.stdout),
-        ],
-    )
-
 
 # ===========================================================================
 # Curated condition mappings
