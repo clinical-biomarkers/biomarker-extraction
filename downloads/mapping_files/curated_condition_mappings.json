@@ -1,0 +1,449 @@
+{
+  "exclude": [
+    "6-month mission to the international space station",
+    "acute dental pain",
+    "anaerobic exercise",
+    "antibody deficiencies",
+    "benign lung lesion",
+    "dental pain",
+    "dentofacial deformities",
+    "exposure to high altitude",
+    "marathon runners",
+    "missing teeth",
+    "oral epithelial dysplasia",
+    "periodontal probing depth",
+    "peritoneal dialysis",
+    "persistent oral mucosal lesions",
+    "physical frailty",
+    "premalignant lesion",
+    "prosthesis/missing teeth",
+    "skeletal maturity",
+    "submandibular abcesseses",
+    "systemic inflammation",
+    "tooth alignment disorders"
+  ],
+  "exposure_agents": {
+    "prenatal arsenic exposure": {
+      "exposure_agent": "arsenic",
+      "exposure_agent_id": "PCCID:5359596"
+    },
+    "yusho disease": {
+      "exposure_agent": "polychlorinated biphenyls",
+      "exposure_agent_id": "PCSID:482590245"
+    }
+  },
+  "conditions": {
+    "salivary gland tumor": [
+      {
+        "condition": "salivary gland cancer",
+        "condition_id": "DOID:8850"
+      }
+    ],
+    "oral leukoplakia": [
+      {
+        "condition": "oral mucosa leukoplakia",
+        "condition_id": "DOID:9655"
+      }
+    ],
+    "halitosis": [
+      {
+        "condition": "breath smells unpleasant",
+        "condition_id": "SCTID:79879001"
+      }
+    ],
+    "tooth decay": [
+      {
+        "condition": "dental caries",
+        "condition_id": "DOID:216"
+      }
+    ],
+    "supragingival plaque": [
+      {
+        "condition": "supragingival dental plaque",
+        "condition_id": "SCTID:65164000"
+      }
+    ],
+    "supragingival calculus": [
+      {
+        "condition": "supragingival dental calculus",
+        "condition_id": "SCTID:18755003"
+      }
+    ],
+    "muscular dystrophies": [
+      {
+        "condition": "muscular dystrophy",
+        "condition_id": "MONDO:0020121"
+      }
+    ],
+    "malignant pleural effusion": [
+      {
+        "condition": "pleural effusion due to malignant neoplastic disease",
+        "condition_id": "SCTID:860792009"
+      }
+    ],
+    "kidney transplant": [
+      {
+        "condition": "transplanted kidney present",
+        "condition_id": "SCTID:737295003"
+      }
+    ],
+    "alcohol and tobacco dependent": [
+      {
+        "condition": "alcohol dependence",
+        "condition_id": "DOID:0050741"
+      },
+      {
+        "condition": "nicotine dependence",
+        "condition_id": "DOID:0050742"
+      }
+    ],
+    "dysplastic leukoplakia": [
+      {
+        "condition": "dysplastic oral leukoplakia",
+        "condition_id": "SCTID:235030009"
+      }
+    ],
+    "human pregnancy": [
+      {
+        "condition": "pregnancy",
+        "condition_id": "SCTID:77386006"
+      }
+    ],
+    "liver transplantation": [
+      {
+        "condition": "transplanted liver present",
+        "condition_id": "SCTID:737297006"
+      }
+    ],
+    "oral cancer": [
+      {
+        "condition": "oral cavity cancer",
+        "condition_id": "DOID:8618"
+      }
+    ],
+    "head and neck tumor": [
+      {
+        "condition": "head and neck cancer",
+        "condition_id": "DOID:11934"
+      }
+    ],
+    "salivary duct carcinomas": [
+      {
+        "condition": "salivary duct carcinoma",
+        "condition_id": "MONDO:0044915"
+      }
+    ],
+    "neoplasm of the salivary gland": [
+      {
+        "condition": "tumor of salivary gland",
+        "condition_id": "MONDO:0021357"
+      }
+    ],
+    "non-intestinal-type adenocarcinoma": [
+      {
+        "condition": "adenocarcinoma",
+        "condition_id": "DOID:299"
+      }
+    ],
+    "salivary gland neoplasm": [
+      {
+        "condition": "tumor of salivary gland",
+        "condition_id": "MONDO:0021357"
+      }
+    ],
+    "parotid salivary gland neoplasms": [
+      {
+        "condition": "tumor of salivary gland",
+        "condition_id": "MONDO:0021357"
+      }
+    ],
+    "adenocarcinomas": [
+      {
+        "condition": "adenocarcinoma",
+        "condition_id": "DOID:299"
+      }
+    ],
+    "concussion": [
+      {
+        "condition": "concussion injury of body structure",
+        "condition_id": "SCTID:708540005"
+      }
+    ],
+    "cumulative concussion": [
+      {
+        "condition": "concussion injury of body structure",
+        "condition_id": "SCTID:708540005"
+      }
+    ],
+    "neonatal opioid withdrawal syndrome": [
+      {
+        "condition": "neonatal abstinence syndrome",
+        "condition_id": "DOID:9828"
+      }
+    ],
+    "sjögren syndrome": [
+      {
+        "condition": "sjogren's syndrome",
+        "condition_id": "DOID:12894"
+      }
+    ],
+    "excessive daytime sleepiness": [
+      {
+        "condition": "excessive daytime sleepiness",
+        "condition_id": "SCTID:1367959007"
+      }
+    ],
+    "acute schizophrenia": [
+      {
+        "condition": "schizophrenia",
+        "condition_id": "DOID:5419"
+      }
+    ],
+    "manic depressive psychosis": [
+      {
+        "condition": "bipolar disorder",
+        "condition_id": "SCTID:13746004"
+      }
+    ],
+    "pain": [
+      {
+        "condition": "pain disorder",
+        "condition_id": "DOID:0060164"
+      }
+    ],
+    "psychological stress": [
+      {
+        "condition": "stress",
+        "condition_id": "SCTID:73595000"
+      }
+    ],
+    "physiologic stress": [
+      {
+        "condition": "stress",
+        "condition_id": "SCTID:73595000"
+      }
+    ],
+    "stress period": [
+      {
+        "condition": "stress",
+        "condition_id": "SCTID:73595000"
+      }
+    ],
+    "physiological stress response": [
+      {
+        "condition": "stress",
+        "condition_id": "SCTID:73595000"
+      }
+    ],
+    "stress": [
+      {
+        "condition": "stress",
+        "condition_id": "SCTID:73595000"
+      }
+    ],
+    "acute psychological stress": [
+      {
+        "condition": "stress",
+        "condition_id": "SCTID:73595000"
+      }
+    ],
+    "acute stress in type d personality": [
+      {
+        "condition": "stress",
+        "condition_id": "SCTID:73595000"
+      }
+    ],
+    "chronic apical abscess": [
+      {
+        "condition": "chronic apical abscess",
+        "condition_id": "SCTID:109603007"
+      }
+    ],
+    "temporomandibular disorders": [
+      {
+        "condition": "temporomandibular joint disorder",
+        "condition_id": "MONDO:0005473"
+      }
+    ],
+    "temporomandibular joint disorder": [
+      {
+        "condition": "temporomandibular joint disorder",
+        "condition_id": "MONDO:0005473"
+      }
+    ],
+    "periodontal diseases": [
+      {
+        "condition": "periodontal disease",
+        "condition_id": "DOID:3388"
+      }
+    ],
+    "mental disorder": [
+      {
+        "condition": "mental disorder",
+        "condition_id": "MONDO:0005084"
+      }
+    ],
+    "thalassemia intermedia": [
+      {
+        "condition": "beta-thalassemia intermedia",
+        "condition_id": "DOID:0080772"
+      }
+    ],
+    "oral cavity disorders": [
+      {
+        "condition": "mouth disorder",
+        "condition_id": "MONDO:0006858"
+      }
+    ],
+    "oral potentially malignant disorders": [
+      {
+        "condition": "mouth disorder",
+        "condition_id": "MONDO:0006858"
+      }
+    ],
+    "attachment loss": [
+      {
+        "condition": "normal periodontal tissue with attachment loss",
+        "condition_id": "SCTID:715842003"
+      }
+    ],
+    "aging": [
+      {
+        "condition": "aging",
+        "condition_id": "SCTID:248280005"
+      }
+    ],
+    "pancreatobiliary tract cancer": [
+      {
+        "condition": "gastrointestinal system cancer",
+        "condition_id": "DOID:3119"
+      }
+    ],
+    "cleft lip and palate": [
+      {
+        "condition": "cleft lip",
+        "condition_id": "DOID:9296"
+      }
+    ],
+    "yin deficiency constitution": [
+      {
+        "condition": "yin deficiency",
+        "condition_id": "SCTID:370538004"
+      }
+    ],
+    "yang deficiency constitution": [
+      {
+        "condition": "yang deficiency",
+        "condition_id": "SCTID:370534002"
+      }
+    ],
+    "acute mountain sickness": [
+      {
+        "condition": "acute mountain sickness",
+        "condition_id": "MONDO:0021811"
+      }
+    ],
+    "developmental disorder": [
+      {
+        "condition": "specific developmental disorder",
+        "condition_id": "DOID:0060038"
+      }
+    ],
+    "periodontal inflammation": [
+      {
+        "condition": "periodontitis",
+        "condition_id": "MONDO:0005076"
+      }
+    ],
+    "alzheimer's disease": [
+      {
+        "condition": "alzheimer's disease",
+        "condition_id": "DOID:10652"
+      }
+    ],
+    "vertigo": [
+      {
+        "condition": "vertigo",
+        "condition_id": "SCTID:399153001"
+      }
+    ],
+    "parkinson's disease": [
+      {
+        "condition": "parkinson's disease",
+        "condition_id": "DOID:14330"
+      }
+    ],
+    "burnout syndrome": [
+      {
+        "condition": "physical and emotional exhaustion state",
+        "condition_id": "SCTID:58535001"
+      }
+    ],
+    "intraductal carcinoma": [
+      {
+        "condition": "non-infiltrating intraductal carcinoma",
+        "condition_id": "SCTID:1162814007"
+      }
+    ],
+    "temporomandibular joint osteoarthritis": [
+      {
+        "condition": "osteoarthritis",
+        "condition_id": "DOID:8398"
+      }
+    ],
+    "oxidative stress in diabetes": [
+      {
+        "condition": "diabetes mellitus",
+        "condition_id": "DOID:9351"
+      }
+    ],
+    "bacterial infection": [
+      {
+        "condition": "bacterial infectious disease",
+        "condition_id": "MONDO:0005113"
+      }
+    ],
+    "periodontal bone destruction": [
+      {
+        "condition": "bone disease",
+        "condition_id": "DOID:0080001"
+      }
+    ],
+    "chronic periodontitis": [
+      {
+        "condition": "periodontitis",
+        "condition_id": "DOID:824"
+      }
+    ],
+    "huntington's disease": [
+      {
+        "condition": "huntington's disease",
+        "condition_id": "DOID:12858"
+      }
+    ],
+    "pediatric acute respiratory illness": [
+      {
+        "condition": "respiratory failure",
+        "condition_id": "DOID:11162"
+      }
+    ],
+    "diabetes mellitus, type 1": [
+      {
+        "condition": "type 1 diabetes mellitus",
+        "condition_id": "DOID:9744"
+      }
+    ],
+    "diabetes mellitus, type 2": [
+      {
+        "condition": "type 2 diabetes mellitus",
+        "condition_id": "DOID:9352"
+      }
+    ],
+    "breast neoplasms": [
+      {
+        "condition": "breast neoplasm",
+        "condition_id": "MONDO:0021100"
+      }
+    ]
+  }
+}

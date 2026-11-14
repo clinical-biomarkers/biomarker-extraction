@@ -6,8 +6,10 @@ Generate the SalivaDB biomarkers dataset from downloaded TSV files.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import gzip
 import io
+import json
 import logging
 import re
 import sys
@@ -28,6 +30,7 @@ DEFAULT_INPUT_DIR = BASE_DIR / "downloads/salivadb"
 DEFAULT_MAPPING_DIR = BASE_DIR / "downloads/mapping_files"
 DEFAULT_OUTPUT_FILE = BASE_DIR / "generated/salivadb/biomarkers_salivadb.tsv"
 DEFAULT_LOG_DIR = BASE_DIR / "logs"
+DEFAULT_CURATED_MAPPING_FILE = BASE_DIR / "downloads/mapping_files/curated_condition_mappings.json"
 
 HGNC_URL = (
     "https://storage.googleapis.com/public-download-files/hgnc/tsv/tsv/hgnc_complete_set.txt"
@@ -109,6 +112,176 @@ def setup_logging(log_dir: Path) -> None:
             logging.StreamHandler(sys.stdout),
         ],
     )
+
+
+# ===========================================================================
+# Curated condition mappings
+# ===========================================================================
+
+
+@dataclasses.dataclass(frozen=True)
+class ConditionMapping:
+    """A single resolved (condition, condition_id) pair from the curated file."""
+    condition: str
+    condition_id: str
+
+
+@dataclasses.dataclass(frozen=True)
+class ExposureAgentMapping:
+    """An exposure-agent resolution from the curated file."""
+    exposure_agent: str
+    exposure_agent_id: str
+
+
+@dataclasses.dataclass
+class CuratedMappings:
+    """
+    Parsed contents of curated_condition_mappings.json.
+
+    Attributes
+    ----------
+    exclude : set[str]
+        Lowercase disease names that should be dropped entirely.
+    conditions : dict[str, list[ConditionMapping]]
+        Lowercase disease name → one or more canonical (condition, condition_id)
+        pairs.  A one-to-many entry produces multiple output rows (explode).
+    exposure_agents : dict[str, ExposureAgentMapping]
+        Lowercase disease name → exposure agent + ID.  These rows keep an empty
+        condition/condition_id and fill the exposure_agent columns instead.
+    """
+
+    exclude: set[str]
+    conditions: dict[str, list[ConditionMapping]]
+    exposure_agents: dict[str, ExposureAgentMapping]
+
+
+def load_curated_mappings(path: Path) -> CuratedMappings:
+    """
+    Load *path* (JSON) and return a :class:`CuratedMappings` instance.
+
+    Expected JSON structure::
+
+        {
+          "exclude": ["physical frailty", ...],
+          "conditions": {
+            "salivary gland tumor": [
+              {"condition": "salivary gland cancer", "condition_id": "DOID:8850"}
+            ],
+            "alcohol and tobacco dependent": [
+              {"condition": "alcohol dependence",  "condition_id": "DOID:0050741"},
+              {"condition": "nicotine dependence", "condition_id": "DOID:0050742"}
+            ]
+          },
+          "exposure_agents": {
+            "prenatal arsenic exposure": {
+              "exposure_agent": "arsenic",
+              "exposure_agent_id": "PCCID:5359596"
+            }
+          }
+        }
+
+    All keys are stored and matched in lowercase.
+    """
+    logger.info("Loading curated condition mappings from %s", path)
+    with open(path, encoding="utf-8") as fh:
+        raw = json.load(fh)
+
+    exclude: set[str] = {s.lower().strip() for s in raw.get("exclude", [])}
+
+    conditions: dict[str, list[ConditionMapping]] = {}
+    for disease_name, entries in raw.get("conditions", {}).items():
+        key = disease_name.lower().strip()
+        conditions[key] = [
+            ConditionMapping(
+                condition=e["condition"].strip(),
+                condition_id=e["condition_id"].strip(),
+            )
+            for e in entries
+        ]
+
+    exposure_agents: dict[str, ExposureAgentMapping] = {}
+    for disease_name, entry in raw.get("exposure_agents", {}).items():
+        key = disease_name.lower().strip()
+        exposure_agents[key] = ExposureAgentMapping(
+            exposure_agent=entry["exposure_agent"].strip(),
+            exposure_agent_id=entry["exposure_agent_id"].strip(),
+        )
+
+    logger.info(
+        "Curated mappings loaded: %d excludes, %d condition remaps, %d exposure agents",
+        len(exclude),
+        len(conditions),
+        len(exposure_agents),
+    )
+    return CuratedMappings(
+        exclude=exclude,
+        conditions=conditions,
+        exposure_agents=exposure_agents,
+    )
+
+
+def resolve_condition(
+    raw_disease_name: str,
+    curated: CuratedMappings,
+    doid: dict[str, str],
+) -> list[tuple[str, str, str, str]]:
+    """
+    Resolve a raw disease name to one or more
+    ``(condition, condition_id, exposure_agent, exposure_agent_id)`` tuples.
+
+    Resolution order
+    ----------------
+    1. Curated exclude list → returns ``[]`` (row is dropped by the caller).
+    2. Curated exposure-agent mapping → one tuple with empty condition fields.
+    3. Curated condition mapping → one tuple per entry (explode for one-to-many).
+    4. DOID exact / fuzzy / OLS fallback → one tuple, exposure fields empty.
+
+    Parameters
+    ----------
+    raw_disease_name:
+        The value straight from ``clean_condition()``.
+    curated:
+        Loaded curated mappings.
+    doid:
+        DOID name→ID dict from :func:`load_doid`.
+
+    Returns
+    -------
+    list of (condition, condition_id, exposure_agent, exposure_agent_id)
+        Empty list means the row should be skipped.
+    """
+    key = raw_disease_name.lower().strip()
+
+    # 1. Exclude
+    if key in curated.exclude:
+        logger.info("Curated exclude: '%s'", raw_disease_name)
+        return []
+
+    # 2. Exposure agent
+    if key in curated.exposure_agents:
+        ea = curated.exposure_agents[key]
+        logger.info(
+            "Curated exposure agent: '%s' → %s (%s)",
+            raw_disease_name,
+            ea.exposure_agent,
+            ea.exposure_agent_id,
+        )
+        return [("", "", ea.exposure_agent, ea.exposure_agent_id)]
+
+    # 3. Curated condition remap (may be one-to-many)
+    if key in curated.conditions:
+        entries = curated.conditions[key]
+        logger.info(
+            "Curated condition remap: '%s' → %d entr%s",
+            raw_disease_name,
+            len(entries),
+            "y" if len(entries) == 1 else "ies",
+        )
+        return [(cm.condition, cm.condition_id, "", "") for cm in entries]
+
+    # 4. DOID fallback (existing fuzzy + OLS logic)
+    condition_id = map_condition_doid(raw_disease_name, doid)
+    return [(raw_disease_name, condition_id, "", "")]
 
 
 # ===========================================================================
@@ -435,6 +608,7 @@ def process_gene(
     df: pd.DataFrame,
     hgnc: dict[str, str],
     doid: dict[str, str],
+    curated: CuratedMappings,
 ) -> pd.DataFrame:
     logger.info("Processing gene.tsv (%d rows before filtering)", len(df))
     df = df[df["Organism"].str.strip() == "Homo sapiens"].copy()
@@ -465,7 +639,10 @@ def process_gene(
         if condition in ("healthy", "na", ""):
             continue
 
-        condition_id = map_condition_doid(condition, doid)
+        condition_tuples = resolve_condition(condition, curated, doid)
+        if not condition_tuples:
+            continue
+
         specimen = map_specimen(str(src.get("Collection_site", "")))
         specimen_id = SPECIMEN_ID_MAP.get(specimen, "")
         evidence_source = parse_evidence_source(
@@ -499,38 +676,39 @@ def process_gene(
             gene_ids = [map_gene_symbol(raw_id, hgnc)]
             entity_indices = [1]
 
-        for role in split_biomarker_role(str(src.get("Biomarker_Type", ""))):
-            for gene_name, gene_id, eidx in zip(gene_names, gene_ids, entity_indices):
-                bvc = build_biomarker_controlled_vocab(
-                    change_type, aspect_type, gene_name, gene_id
-                )
-                rows.append(
-                    {
-                        "biomarker_index": sal_id,
-                        "component_index": "1",
-                        "entity_index": str(eidx),
-                        "assessed_biomarker_entity": gene_name,
-                        "assessed_biomarker_entity_id": gene_id,
-                        "assessed_entity_type": entity_type,
-                        "condition": condition,
-                        "condition_id": condition_id,
-                        "best_biomarker_role": role,
-                        "specimen": specimen,
-                        "specimen_id": specimen_id,
-                        "loinc_code": "",
-                        "evidence_source": evidence_source,
-                        "evidence": "",
-                        "biomarker": bvc,
-                        "exposure_agent": "",
-                        "exposure_agent_id": "",
-                        "tag": "",
-                        "biomarker_controlled_vocab": bvc,
-                        "change_type_vocab": change_type,
-                        "aspect_type_vocab": aspect_type,
-                        "mod_type_vocab": "not_specified",
-                        "legacy_biomarker_id": "no_legacy_biomarker_id",
-                    }
-                )
+        for cond, cond_id, exp_agent, exp_agent_id in condition_tuples:
+            for role in split_biomarker_role(str(src.get("Biomarker_Type", ""))):
+                for gene_name, gene_id, eidx in zip(gene_names, gene_ids, entity_indices):
+                    bvc = build_biomarker_controlled_vocab(
+                        change_type, aspect_type, gene_name, gene_id
+                    )
+                    rows.append(
+                        {
+                            "biomarker_index": sal_id,
+                            "component_index": "1",
+                            "entity_index": str(eidx),
+                            "assessed_biomarker_entity": gene_name,
+                            "assessed_biomarker_entity_id": gene_id,
+                            "assessed_entity_type": entity_type,
+                            "condition": cond,
+                            "condition_id": cond_id,
+                            "best_biomarker_role": role,
+                            "specimen": specimen,
+                            "specimen_id": specimen_id,
+                            "loinc_code": "",
+                            "evidence_source": evidence_source,
+                            "evidence": "",
+                            "biomarker": bvc,
+                            "exposure_agent": exp_agent,
+                            "exposure_agent_id": exp_agent_id,
+                            "tag": "",
+                            "biomarker_controlled_vocab": bvc,
+                            "change_type_vocab": change_type,
+                            "aspect_type_vocab": aspect_type,
+                            "mod_type_vocab": "not_specified",
+                            "legacy_biomarker_id": "no_legacy_biomarker_id",
+                        }
+                    )
 
     logger.info("gene.tsv produced %d output rows", len(rows))
     return pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
@@ -539,6 +717,7 @@ def process_gene(
 def process_metabolite(
     df: pd.DataFrame,
     doid: dict[str, str],
+    curated: CuratedMappings,
 ) -> pd.DataFrame:
     logger.info("Processing metabolite.tsv (%d rows before filtering)", len(df))
     df = df[df["Organism"].str.strip() == "Homo sapiens"].copy()
@@ -552,7 +731,10 @@ def process_metabolite(
         if condition in ("healthy", "na", ""):
             continue
 
-        condition_id = map_condition_doid(condition, doid)
+        condition_tuples = resolve_condition(condition, curated, doid)
+        if not condition_tuples:
+            continue
+
         specimen = map_specimen(str(src.get("Collection_site", "")))
         specimen_id = SPECIMEN_ID_MAP.get(specimen, "")
         evidence_source = parse_evidence_source(
@@ -569,39 +751,40 @@ def process_metabolite(
         if not ids:
             ids = [""]
 
-        for pid in ids:
-            entity_id = f"PCCID:{pid}" if pid else ""
-            bvc = build_biomarker_controlled_vocab(
-                change_type, aspect_type, entity_name, entity_id
-            )
-            for role in split_biomarker_role(str(src.get("Biomarker_Type", ""))):
-                rows.append(
-                    {
-                        "biomarker_index": sal_id,
-                        "component_index": "1",
-                        "entity_index": "1",
-                        "assessed_biomarker_entity": entity_name,
-                        "assessed_biomarker_entity_id": entity_id,
-                        "assessed_entity_type": entity_type,
-                        "condition": condition,
-                        "condition_id": condition_id,
-                        "best_biomarker_role": role,
-                        "specimen": specimen,
-                        "specimen_id": specimen_id,
-                        "loinc_code": "",
-                        "evidence_source": evidence_source,
-                        "evidence": "",
-                        "biomarker": bvc,
-                        "exposure_agent": "",
-                        "exposure_agent_id": "",
-                        "tag": "",
-                        "biomarker_controlled_vocab": bvc,
-                        "change_type_vocab": change_type,
-                        "aspect_type_vocab": aspect_type,
-                        "mod_type_vocab": "not_specified",
-                        "legacy_biomarker_id": "no_legacy_biomarker_id",
-                    }
+        for cond, cond_id, exp_agent, exp_agent_id in condition_tuples:
+            for pid in ids:
+                entity_id = f"PCCID:{pid}" if pid else ""
+                bvc = build_biomarker_controlled_vocab(
+                    change_type, aspect_type, entity_name, entity_id
                 )
+                for role in split_biomarker_role(str(src.get("Biomarker_Type", ""))):
+                    rows.append(
+                        {
+                            "biomarker_index": sal_id,
+                            "component_index": "1",
+                            "entity_index": "1",
+                            "assessed_biomarker_entity": entity_name,
+                            "assessed_biomarker_entity_id": entity_id,
+                            "assessed_entity_type": entity_type,
+                            "condition": cond,
+                            "condition_id": cond_id,
+                            "best_biomarker_role": role,
+                            "specimen": specimen,
+                            "specimen_id": specimen_id,
+                            "loinc_code": "",
+                            "evidence_source": evidence_source,
+                            "evidence": "",
+                            "biomarker": bvc,
+                            "exposure_agent": exp_agent,
+                            "exposure_agent_id": exp_agent_id,
+                            "tag": "",
+                            "biomarker_controlled_vocab": bvc,
+                            "change_type_vocab": change_type,
+                            "aspect_type_vocab": aspect_type,
+                            "mod_type_vocab": "not_specified",
+                            "legacy_biomarker_id": "no_legacy_biomarker_id",
+                        }
+                    )
 
     logger.info("metabolite.tsv produced %d output rows", len(rows))
     return pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
@@ -611,6 +794,7 @@ def process_mirna(
     df: pd.DataFrame,
     mirbase: dict[str, str],
     doid: dict[str, str],
+    curated: CuratedMappings,
 ) -> pd.DataFrame:
     logger.info("Processing mirna.tsv (%d rows before filtering)", len(df))
     df = df[df["Organism"].str.strip() == "Homo sapiens"].copy()
@@ -624,7 +808,10 @@ def process_mirna(
         if condition in ("healthy", "na", ""):
             continue
 
-        condition_id = map_condition_doid(condition, doid)
+        condition_tuples = resolve_condition(condition, curated, doid)
+        if not condition_tuples:
+            continue
+
         specimen = map_specimen(str(src.get("Collection_site", "")))
         specimen_id = SPECIMEN_ID_MAP.get(specimen, "")
         evidence_source = parse_evidence_source(
@@ -641,34 +828,35 @@ def process_mirna(
             change_type, aspect_type, entity_name, entity_id
         )
 
-        for role in split_biomarker_role(str(src.get("Biomarker_Type", ""))):
-            rows.append(
-                {
-                    "biomarker_index": sal_id,
-                    "component_index": "1",
-                    "entity_index": "1",
-                    "assessed_biomarker_entity": entity_name,
-                    "assessed_biomarker_entity_id": entity_id,
-                    "assessed_entity_type": entity_type,
-                    "condition": condition,
-                    "condition_id": condition_id,
-                    "best_biomarker_role": role,
-                    "specimen": specimen,
-                    "specimen_id": specimen_id,
-                    "loinc_code": "",
-                    "evidence_source": evidence_source,
-                    "evidence": "",
-                    "biomarker": bvc,
-                    "exposure_agent": "",
-                    "exposure_agent_id": "",
-                    "tag": "",
-                    "biomarker_controlled_vocab": bvc,
-                    "change_type_vocab": change_type,
-                    "aspect_type_vocab": aspect_type,
-                    "mod_type_vocab": "not_specified",
-                    "legacy_biomarker_id": "no_legacy_biomarker_id",
-                }
-            )
+        for cond, cond_id, exp_agent, exp_agent_id in condition_tuples:
+            for role in split_biomarker_role(str(src.get("Biomarker_Type", ""))):
+                rows.append(
+                    {
+                        "biomarker_index": sal_id,
+                        "component_index": "1",
+                        "entity_index": "1",
+                        "assessed_biomarker_entity": entity_name,
+                        "assessed_biomarker_entity_id": entity_id,
+                        "assessed_entity_type": entity_type,
+                        "condition": cond,
+                        "condition_id": cond_id,
+                        "best_biomarker_role": role,
+                        "specimen": specimen,
+                        "specimen_id": specimen_id,
+                        "loinc_code": "",
+                        "evidence_source": evidence_source,
+                        "evidence": "",
+                        "biomarker": bvc,
+                        "exposure_agent": exp_agent,
+                        "exposure_agent_id": exp_agent_id,
+                        "tag": "",
+                        "biomarker_controlled_vocab": bvc,
+                        "change_type_vocab": change_type,
+                        "aspect_type_vocab": aspect_type,
+                        "mod_type_vocab": "not_specified",
+                        "legacy_biomarker_id": "no_legacy_biomarker_id",
+                    }
+                )
 
     logger.info("mirna.tsv produced %d output rows", len(rows))
     return pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
@@ -677,6 +865,7 @@ def process_mirna(
 def process_protein(
     df: pd.DataFrame,
     doid: dict[str, str],
+    curated: CuratedMappings,
 ) -> pd.DataFrame:
     logger.info("Processing protein.tsv (%d rows before filtering)", len(df))
     df = df[df["Organism"].str.strip() == "Homo sapiens"].copy()
@@ -690,7 +879,10 @@ def process_protein(
         if condition in ("healthy", "na", ""):
             continue
 
-        condition_id = map_condition_doid(condition, doid)
+        condition_tuples = resolve_condition(condition, curated, doid)
+        if not condition_tuples:
+            continue
+
         specimen = map_specimen(str(src.get("Collection_site", "")))
         specimen_id = SPECIMEN_ID_MAP.get(specimen, "")
         evidence_source = parse_evidence_source(
@@ -707,34 +899,35 @@ def process_protein(
             change_type, aspect_type, entity_name, entity_id
         )
 
-        for role in split_biomarker_role(str(src.get("Biomarker_Type", ""))):
-            rows.append(
-                {
-                    "biomarker_index": sal_id,
-                    "component_index": "1",
-                    "entity_index": "1",
-                    "assessed_biomarker_entity": entity_name,
-                    "assessed_biomarker_entity_id": entity_id,
-                    "assessed_entity_type": entity_type,
-                    "condition": condition,
-                    "condition_id": condition_id,
-                    "best_biomarker_role": role,
-                    "specimen": specimen,
-                    "specimen_id": specimen_id,
-                    "loinc_code": "",
-                    "evidence_source": evidence_source,
-                    "evidence": "",
-                    "biomarker": bvc,
-                    "exposure_agent": "",
-                    "exposure_agent_id": "",
-                    "tag": "",
-                    "biomarker_controlled_vocab": bvc,
-                    "change_type_vocab": change_type,
-                    "aspect_type_vocab": aspect_type,
-                    "mod_type_vocab": "not_specified",
-                    "legacy_biomarker_id": "no_legacy_biomarker_id",
-                }
-            )
+        for cond, cond_id, exp_agent, exp_agent_id in condition_tuples:
+            for role in split_biomarker_role(str(src.get("Biomarker_Type", ""))):
+                rows.append(
+                    {
+                        "biomarker_index": sal_id,
+                        "component_index": "1",
+                        "entity_index": "1",
+                        "assessed_biomarker_entity": entity_name,
+                        "assessed_biomarker_entity_id": entity_id,
+                        "assessed_entity_type": entity_type,
+                        "condition": cond,
+                        "condition_id": cond_id,
+                        "best_biomarker_role": role,
+                        "specimen": specimen,
+                        "specimen_id": specimen_id,
+                        "loinc_code": "",
+                        "evidence_source": evidence_source,
+                        "evidence": "",
+                        "biomarker": bvc,
+                        "exposure_agent": exp_agent,
+                        "exposure_agent_id": exp_agent_id,
+                        "tag": "",
+                        "biomarker_controlled_vocab": bvc,
+                        "change_type_vocab": change_type,
+                        "aspect_type_vocab": aspect_type,
+                        "mod_type_vocab": "not_specified",
+                        "legacy_biomarker_id": "no_legacy_biomarker_id",
+                    }
+                )
 
     logger.info("protein.tsv produced %d output rows", len(rows))
     return pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
@@ -773,6 +966,12 @@ def main() -> None:
         default=DEFAULT_LOG_DIR,
         help=f"Directory for log files (default: {DEFAULT_LOG_DIR})",
     )
+    parser.add_argument(
+        "--curated-mapping-file",
+        type=Path,
+        default=DEFAULT_CURATED_MAPPING_FILE,
+        help=f"Path to curated condition mappings JSON (default: {DEFAULT_CURATED_MAPPING_FILE})",
+    )
     args = parser.parse_args()
 
     setup_logging(args.log_dir)
@@ -790,6 +989,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Load mapping tables
     # ------------------------------------------------------------------
+    curated = load_curated_mappings(args.curated_mapping_file)
     hgnc = load_hgnc(hgnc_file)
     doid = load_doid(doid_file)
     mirbase = load_mirbase(mirbase_file)
@@ -811,10 +1011,10 @@ def main() -> None:
     # Process each source
     # ------------------------------------------------------------------
     frames = [
-        process_gene(gene_df, hgnc, doid),
-        process_metabolite(metabolite_df, doid),
-        process_mirna(mirna_df, mirbase, doid),
-        process_protein(protein_df, doid),
+        process_gene(gene_df, hgnc, doid, curated),
+        process_metabolite(metabolite_df, doid, curated),
+        process_mirna(mirna_df, mirbase, doid, curated),
+        process_protein(protein_df, doid, curated),
     ]
 
     result = pd.concat(frames, ignore_index=True)
