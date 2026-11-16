@@ -8,3 +8,4 @@ generated/
 logs/
 nohup.out
 __pycache__/
+*.pyc
