@@ -1,9 +1,12 @@
+build/
 downloads/*
 !downloads/mapping_files/
 downloads/mapping_files/*
 !downloads/mapping_files/curated_condition_mappings.json
+*.egg-info
 env/
 .env
+dist/
 generated/
 logs/
 nohup.out
