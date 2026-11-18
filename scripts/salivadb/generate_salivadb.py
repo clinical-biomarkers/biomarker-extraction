@@ -626,6 +626,22 @@ def process_gene(
         raw_id = str(src["ID"]).strip()
         is_fusion = bool(GENE_FUSION_PATTERN.match(raw_id))
 
+        condition = clean_condition(str(src["Disease_name"]))
+        if condition in ("healthy", "na", ""):
+            continue
+
+        condition_tuples = resolve_condition(condition, curated, doid)
+        if not condition_tuples:
+            continue
+
+        specimen = map_specimen(str(src.get("Collection_site", "")))
+        specimen_id = SPECIMEN_ID_MAP.get(specimen, "")
+        evidence_source = parse_evidence_source(str(src.get("PMID", "")))
+        if evidence_source is None:
+            continue
+        entity_type = str(src.get("Biomarker", "")).strip().lower()
+        base_name = clean_biomarker_name(str(src["Biomarker_Name"]))
+
         if is_fusion:
             change_type = "presence of"
             aspect_type = "sequence variation"
