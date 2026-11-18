@@ -40,6 +40,8 @@ HGNC_URL = (
 
 DOID_URL = "https://raw.githubusercontent.com/DiseaseOntology/HumanDiseaseOntology/main/src/ontology/doid.obo"
 MIRBASE_URL = "https://mirbase.org/download/CURRENT/id_mapping.tsv"
+MIRBASE_ALIASES_URL = "https://mirbase.org/download/CURRENT/aliases.txt"
+MIRBASE_REST_URL = "https://mirbase.org/api/v1/mature/"
 
 OLS_API = "https://www.ebi.ac.uk/ols4/api/search"
 
@@ -96,6 +98,16 @@ CHANGE_TYPE_MAP = {
 GENE_FUSION_PATTERN = re.compile(
     r"^[A-Za-z]{3,}[0-9][A-Za-z]{3,}[0-9](\s+\S+)?$"
 )
+
+# Maps organism name → expected miRNA ID prefix (3-letter species code).
+# Used by process_mirna to detect cross-species contamination in the data.
+ORGANISM_MIRNA_PREFIX: dict[str, str] = {
+    "Homo sapiens": "hsa",
+    "Mus musculus": "mmu",
+    "Rattus norvegicus": "rno",
+    "Bos taurus": "bta",
+    "Gallus gallus": "gga",
+}
 
 # ===========================================================================
 # Curated condition mappings
@@ -355,7 +367,7 @@ def load_doid(doid_file: Path) -> dict[str, str]:
 
 
 def load_mirbase(mirbase_file: Path) -> dict[str, str]:
-    """Return {mature_id_or_stem_loop_name → 'MRB:<accession>'}."""
+    """Return {mature_id_or_stem_loop_name → 'MRB:<accession>'} from id_mapping.tsv."""
     download_if_missing(MIRBASE_URL, mirbase_file)
     logger.info("Loading miRBase mapping from %s", mirbase_file)
     # id_mapping.tsv columns: accession, name, type, mature/hairpin flag
@@ -368,6 +380,44 @@ def load_mirbase(mirbase_file: Path) -> dict[str, str]:
             mapping[name.upper()] = f"MRB:{acc}"
     logger.info("miRBase: loaded %d name→accession entries", len(mapping))
     return mapping
+
+
+def load_mirbase_aliases(aliases_file: Path) -> dict[str, str]:
+    """
+    Parse miRBase aliases.txt and return a reverse index
+    ``{historical_or_alternate_name_upper → 'MRB:MIMAT...'}``.
+
+    Format of aliases.txt (tab-separated)::
+
+        MIMAT0000001\\thsa-miR-21-5p;hsa-miR-21;hsa-miR-21-AS
+
+    Every semicolon-delimited alias for each accession is indexed so that
+    old-style names (e.g. ``hsa-miR-93`` without an arm designation) resolve
+    to the current accession.  ``setdefault`` ensures that the first
+    accession claiming an alias wins (aliases are listed most-current first
+    in the file).
+    """
+    download_if_missing(MIRBASE_ALIASES_URL, aliases_file)
+    logger.info("Loading miRBase aliases from %s", aliases_file)
+    reverse: dict[str, str] = {}
+    with open(aliases_file, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            acc = parts[0].strip()
+            if not acc:
+                continue
+            mrb_id = f"MRB:{acc}"
+            for alias in parts[1].split(";"):
+                alias = alias.strip()
+                if alias:
+                    reverse.setdefault(alias.upper(), mrb_id)
+    logger.info("miRBase aliases: loaded %d alias→accession entries", len(reverse))
+    return reverse
 
 
 # ===========================================================================
@@ -427,6 +477,47 @@ def _ncbi_gene_lookup(symbol: str, api_key: str = "") -> str:
     logger.error("NCBI Gene: exhausted retries for '%s'; dropping", symbol)
     _ncbi_gene_cache[key] = ""
     return ""
+
+
+_mirbase_api_cache: dict[str, str] = {}
+
+
+def _mirbase_api_lookup(mirna_id: str) -> str:
+    """
+    Query the miRBase REST API for a single miRNA name.
+
+    Endpoint: ``GET https://mirbase.org/api/v1/mature/?format=json&search=<id>``
+
+    Returns ``'MRB:MIMAT...'`` on success, or ``''`` if no match or the
+    request fails.  Results are cached so each unique ID is only queried once.
+    """
+    key = mirna_id.strip()
+    if key in _mirbase_api_cache:
+        return _mirbase_api_cache[key]
+
+    try:
+        resp = requests.get(
+            MIRBASE_REST_URL,
+            params={"format": "json", "search": key},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results", [])
+        if results:
+            acc = results[0].get("mature_acc", "")
+            if acc:
+                mrb_id = f"MRB:{acc}"
+                logger.info("miRBase API fallback: '%s' → %s", mirna_id, mrb_id)
+                _mirbase_api_cache[key] = mrb_id
+                return mrb_id
+        logger.warning("miRBase API: no result for '%s'", mirna_id)
+    except requests.RequestException:
+        logger.exception("miRBase API lookup failed for '%s'", mirna_id)
+
+    _mirbase_api_cache[key] = ""
+    return ""
+
 
 def map_gene_symbol(
     symbol: str,
@@ -504,17 +595,51 @@ def _ols_lookup(condition: str) -> str:
 def map_mirna_id(
     mirna_id: str,
     mirbase: dict[str, str],
+    aliases: dict[str, str],
 ) -> str:
-    """Map a miRNA ID to 'MRB:<accession>'."""
+    """
+    Map a miRNA ID to ``'MRB:<accession>'`` using a four-tier lookup:
+
+    1. Direct match in ``id_mapping.tsv`` (``mirbase`` dict).
+    2. Stem-loop fallback: strip ``-5p`` / ``-3p`` arm suffix and retry (1).
+    3. ``aliases.txt`` reverse index (``aliases`` dict), including stem-loop
+       variant — catches old-style names such as ``hsa-miR-93`` that were
+       renamed before arm designations were standardised.
+    4. miRBase REST API (per-entry HTTP GET, cached) — last resort for IDs
+       that postdate the downloaded flat files.
+
+    Returns the original *mirna_id* unchanged (not ``''``) when all four
+    tiers fail so the row is kept and the unmapped ID is visible in the
+    output for human review.
+    """
     key = mirna_id.strip().upper()
+
+    # 1. Direct match in id_mapping.tsv
     if key in mirbase:
         return mirbase[key]
-    # Try stem-loop (e.g. strip the -5p/-3p suffix)
+
+    # 2. Stem-loop fallback (strip -5p / -3p)
     stem = re.sub(r"[-_][35]P$", "", key)
-    if stem in mirbase:
-        logger.info("miRNA stem-loop fallback: '%s' → '%s'", mirna_id, mirbase[stem])
+    if stem != key and stem in mirbase:
+        logger.info("miRNA stem-loop fallback: '%s' → %s", mirna_id, mirbase[stem])
         return mirbase[stem]
-    logger.warning("miRNA ID not mapped: %s", mirna_id)
+
+    # 3. aliases.txt reverse index
+    if key in aliases:
+        logger.info("miRNA aliases fallback: '%s' → %s", mirna_id, aliases[key])
+        return aliases[key]
+    if stem != key and stem in aliases:
+        logger.info(
+            "miRNA aliases stem fallback: '%s' → %s", mirna_id, aliases[stem]
+        )
+        return aliases[stem]
+
+    # 4. miRBase REST API
+    result = _mirbase_api_lookup(mirna_id.strip())
+    if result:
+        return result
+
+    logger.warning("miRNA ID not mapped after all lookup tiers: %s", mirna_id)
     return mirna_id
 
 
@@ -785,9 +910,25 @@ def process_metabolite(
 def process_mirna(
     df: pd.DataFrame,
     mirbase: dict[str, str],
+    aliases: dict[str, str],
     doid: dict[str, str],
     curated: CuratedMappings,
 ) -> pd.DataFrame:
+    """
+    Process mirna.tsv.
+
+    Only ``Organism == 'Homo sapiens'`` rows are kept (pre-filtered before
+    this function is called, but re-confirmed here for safety).
+
+    For each row the miRNA ID prefix (e.g. ``hsa``, ``mmu``) is checked
+    against the row's organism:
+
+    * Any prefix that does not match the expected species code is logged as a
+      WARNING so data-quality issues are visible in the run log.
+    * Rows whose ID prefix is ``mmu`` (Mus musculus) are **dropped**; mouse
+      miRNAs erroneously attributed to human samples would corrupt the
+      human-only biomarker database.
+    """
     logger.info("Processing mirna.tsv (%d rows before filtering)", len(df))
     df = df[df["Organism"].str.strip() == "Homo sapiens"].copy()
     df = df[~df["Disease_name"].str.strip().isin(["Healthy", "NA"])].copy()
@@ -796,6 +937,36 @@ def process_mirna(
     rows = []
     for _, src in df.iterrows():
         sal_id = str(src["SAL_ID"]).split("_")[-1]
+        raw_id = str(src["ID"]).strip()
+        organism = str(src["Organism"]).strip()
+
+        # ------------------------------------------------------------------
+        # Organism / ID-prefix consistency check
+        # ------------------------------------------------------------------
+        prefix_match = re.match(r"^([a-z]{3,4})-", raw_id.lower())
+        id_prefix = prefix_match.group(1) if prefix_match else ""
+        expected_prefix = ORGANISM_MIRNA_PREFIX.get(organism, "")
+
+        if id_prefix and expected_prefix and id_prefix != expected_prefix:
+            logger.warning(
+                "miRNA prefix/organism mismatch: ID '%s' (prefix '%s') in "
+                "Organism '%s' row SAL_ID=%s PMID=%s — possible cross-species "
+                "contamination or data-entry error",
+                raw_id,
+                id_prefix,
+                organism,
+                sal_id,
+                src.get("PMID", ""),
+            )
+            if id_prefix == "mmu":
+                logger.warning(
+                    "Dropping mmu-prefixed row: SAL_ID=%s ID='%s' (mouse miRNA "
+                    "attributed to Homo sapiens)",
+                    sal_id,
+                    raw_id,
+                )
+                continue
+
         condition = clean_condition(str(src["Disease_name"]))
         if condition in ("healthy", "na", ""):
             continue
@@ -814,8 +985,7 @@ def process_mirna(
         change_type = map_change_type(str(src.get("Regulation", "")))
         aspect_type = "expression"
 
-        raw_id = str(src["ID"]).strip()
-        entity_id = map_mirna_id(raw_id, mirbase)
+        entity_id = map_mirna_id(raw_id, mirbase, aliases)
         bvc = build_biomarker_controlled_vocab(
             change_type, aspect_type, entity_name, entity_id
         )
@@ -979,6 +1149,7 @@ def main() -> None:
     hgnc_file = args.mapping_dir / "hgnc_complete_set.txt"
     doid_file = args.mapping_dir / "doid.obo"
     mirbase_file = args.mapping_dir / "mirbase_id_mapping.tsv"
+    mirbase_aliases_file = args.mapping_dir / "mirbase_aliases.txt"
 
     logger.info("=== SalivaDB extraction started ===")
     logger.info("Input directory : %s", args.input_dir)
@@ -992,6 +1163,7 @@ def main() -> None:
     hgnc = load_hgnc(hgnc_file)
     doid = load_doid(doid_file)
     mirbase = load_mirbase(mirbase_file)
+    mirbase_aliases = load_mirbase_aliases(mirbase_aliases_file)
 
     # ------------------------------------------------------------------
     # Load source files
@@ -1012,7 +1184,7 @@ def main() -> None:
     frames = [
         process_gene(gene_df, hgnc, doid, curated, ncbi_api_key=args.ncbi_api_key),
         process_metabolite(metabolite_df, doid, curated),
-        process_mirna(mirna_df, mirbase, doid, curated),
+        process_mirna(mirna_df, mirbase, mirbase_aliases, doid, curated),
         process_protein(protein_df, doid, curated),
     ]
 
