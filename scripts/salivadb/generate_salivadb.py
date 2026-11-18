@@ -6,9 +6,13 @@ import gzip
 import io
 import json
 import logging
+import os
 import re
 import sys
+import time
+import xml.etree.ElementTree as ET
 from datetime import datetime
+from dotenv import load_dotenv
 from pathlib import Path
 from typing import Optional
 
@@ -38,6 +42,9 @@ DOID_URL = "https://raw.githubusercontent.com/DiseaseOntology/HumanDiseaseOntolo
 MIRBASE_URL = "https://mirbase.org/download/CURRENT/id_mapping.tsv"
 
 OLS_API = "https://www.ebi.ac.uk/ols4/api/search"
+
+NCBI_ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+NCBI_EFETCH_URL  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 
 OUTPUT_COLUMNS = [
     "biomarker_index",
@@ -303,7 +310,6 @@ def load_hgnc(hgnc_file: Path) -> dict[str, str]:
     return mapping
 
 
-
 def load_doid(doid_file: Path) -> dict[str, str]:
     """
     Parse doid.obo and return {lowercase_name → 'DOID:XXXXXXX'}.
@@ -368,14 +374,102 @@ def load_mirbase(mirbase_file: Path) -> dict[str, str]:
 # ID look-up helpers
 # ===========================================================================
 
+_ncbi_gene_cache: dict[str, str] = {}
 
-def map_gene_symbol(symbol: str, hgnc: dict[str, str]) -> str:
-    """Map a gene symbol to an HGNC ID; return empty string if not found."""
+
+def _ncbi_gene_lookup(symbol: str, api_key: str = "") -> str:
+    """
+    Query NCBI Gene for *symbol* (Homo sapiens) and return its HGNC ID string
+    (e.g. ``'HGNC:5'``), or ``''`` if not found.
+
+    Results are cached in ``_ncbi_gene_cache`` to avoid redundant API calls.
+    NCBI allows 3 req/s without an API key; we sleep 0.34 s between the two
+    calls to stay within that limit.  Pass an API key to raise the limit to
+    10 req/s and skip the sleep.
+    """
+    key = symbol.strip().upper()
+    if key in _ncbi_gene_cache:
+        return _ncbi_gene_cache[key]
+
+    params_base = {"api_key": api_key} if api_key else {}
+
+    try:
+        # --- Step 1: esearch → Gene ID ---
+        resp = requests.get(
+            NCBI_ESEARCH_URL,
+            params={
+                **params_base,
+                "db": "gene",
+                "term": f'{key}[sym] AND "Homo sapiens"[Organism]',
+                "retmode": "json",
+                "retmax": 1,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        ids = resp.json().get("esearchresult", {}).get("idlist", [])
+        if not ids:
+            logger.warning("NCBI Gene: no result for symbol '%s'", symbol)
+            _ncbi_gene_cache[key] = ""
+            return ""
+
+        gene_id = ids[0]
+        if not api_key:
+            time.sleep(0.34)  # stay within 3 req/s rate limit
+
+        # --- Step 2: efetch XML → HGNC xref ---
+        resp = requests.get(
+            NCBI_EFETCH_URL,
+            params={
+                **params_base,
+                "db": "gene",
+                "id": gene_id,
+                "retmode": "xml",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+
+        root = ET.fromstring(resp.content)
+        # HGNC xref lives in Gene-ref/Gene-ref_db/Dbtag nodes
+        for dbtag in root.iter("Dbtag"):
+            db_el = dbtag.find("Dbtag_db")
+            if db_el is not None and db_el.text == "HGNC":
+                tag_el = dbtag.find("Dbtag_tag/Object-id/Object-id_id")
+                if tag_el is not None and tag_el.text:
+                    hgnc_id = f"HGNC:{tag_el.text}"
+                    logger.info(
+                        "NCBI Gene fallback: '%s' (Gene ID %s) → %s",
+                        symbol, gene_id, hgnc_id,
+                    )
+                    _ncbi_gene_cache[key] = hgnc_id
+                    return hgnc_id
+
+        logger.warning(
+            "NCBI Gene: no HGNC xref for symbol '%s' (Gene ID %s)", symbol, gene_id
+        )
+
+    except (requests.RequestException, ET.ParseError):
+        logger.exception("NCBI Gene lookup failed for '%s'", symbol)
+
+    _ncbi_gene_cache[key] = ""
+    return ""
+
+
+def map_gene_symbol(
+    symbol: str,
+    hgnc: dict[str, str],
+    ncbi_api_key: str = "",
+) -> str:
+    """Map a gene symbol to an HGNC ID; falls back to NCBI Gene API on miss."""
     key = symbol.strip().upper()
     if key in hgnc:
         return hgnc[key]
-    logger.warning("Gene symbol not mapped: %s", symbol)
-    return ""
+    # HGNC table miss → try NCBI Gene
+    result = _ncbi_gene_lookup(key, api_key=ncbi_api_key)
+    if not result:
+        logger.warning("Gene symbol not mapped: %s", symbol)
+    return result
 
 
 def map_condition_doid(
@@ -433,7 +527,6 @@ def _ols_lookup(condition: str) -> str:
     except requests.RequestException:
         logger.exception("OLS lookup failed for '%s'", condition)
     return ""
-
 
 
 def map_mirna_id(
@@ -549,6 +642,7 @@ def process_gene(
     hgnc: dict[str, str],
     doid: dict[str, str],
     curated: CuratedMappings,
+    ncbi_api_key: str = "",
 ) -> pd.DataFrame:
     logger.info("Processing gene.tsv (%d rows before filtering)", len(df))
     df = df[df["Organism"].str.strip() == "Homo sapiens"].copy()
@@ -606,14 +700,14 @@ def process_gene(
                 gene_a_sym = raw_id[:mid]
                 gene_b_raw = raw_id[mid:]
 
-            id_a = map_gene_symbol(gene_a_sym, hgnc)
-            id_b = map_gene_symbol(gene_b_raw, hgnc)
+            id_a = map_gene_symbol(gene_a_sym, hgnc, ncbi_api_key)
+            id_b = map_gene_symbol(gene_b_raw, hgnc, ncbi_api_key)
             gene_names = [gene_a_sym, gene_b_raw]
             gene_ids = [id_a, id_b]
             entity_indices = [1, 2]
         else:
             gene_names = [base_name]
-            gene_ids = [map_gene_symbol(raw_id, hgnc)]
+            gene_ids = [map_gene_symbol(raw_id, hgnc, ncbi_api_key)]
             entity_indices = [1]
 
         for cond, cond_id, exp_agent, exp_agent_id in condition_tuples:
@@ -879,6 +973,7 @@ def process_protein(
 
 
 def main() -> None:
+    load_dotenv()
     parser = argparse.ArgumentParser(
         description="Generate SalivaDB biomarkers dataset."
     )
@@ -911,6 +1006,12 @@ def main() -> None:
         type=Path,
         default=DEFAULT_CURATED_MAPPING_FILE,
         help=f"Path to curated condition mappings JSON (default: {DEFAULT_CURATED_MAPPING_FILE})",
+    )
+    parser.add_argument(
+        "--ncbi-api-key",
+        default=os.environ.get("NCBI_API_KEY", ""),
+        help="NCBI API key (optional; raises rate limit from 3 to 10 req/s). "
+            "Falls back to NCBI_API_KEY env var.",
     )
     args = parser.parse_args()
 
@@ -951,7 +1052,7 @@ def main() -> None:
     # Process each source
     # ------------------------------------------------------------------
     frames = [
-        process_gene(gene_df, hgnc, doid, curated),
+        process_gene(gene_df, hgnc, doid, curated, ncbi_api_key=args.ncbi_api_key),
         process_metabolite(metabolite_df, doid, curated),
         process_mirna(mirna_df, mirbase, doid, curated),
         process_protein(protein_df, doid, curated),
