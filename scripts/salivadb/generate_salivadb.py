@@ -41,6 +41,15 @@ HGNC_URL = (
 DOID_URL = "https://raw.githubusercontent.com/DiseaseOntology/HumanDiseaseOntology/main/src/ontology/doid.obo"
 MIRBASE_URL = "https://mirbase.org/download/CURRENT/id_mapping.tsv"
 
+# Previous miRBase releases whose miRNA.dat files are used as a secondary
+# lookup for old-style names that lack arm designations (e.g. hsa-miR-93).
+# Tried newest → oldest so the most-recent accession wins on conflicts.
+MIRBASE_DAT_RELEASES = [22, 21, 20]
+MIRBASE_DAT_BASE = "https://mirbase.org/download_version_files"
+
+# miRBase REST API for per-entry fallback (Tier 3).
+MIRBASE_REST_API = "https://mirbase.org/api/v1/mature/"
+
 OLS_API = "https://www.ebi.ac.uk/ols4/api/search"
 
 NCBI_ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
@@ -354,20 +363,159 @@ def load_doid(doid_file: Path) -> dict[str, str]:
     return name_to_id
 
 
-def load_mirbase(mirbase_file: Path) -> dict[str, str]:
-    """Return {mature_id_or_stem_loop_name → 'MRB:<accession>'}."""
-    download_if_missing(MIRBASE_URL, mirbase_file)
-    logger.info("Loading miRBase mapping from %s", mirbase_file)
-    # id_mapping.tsv columns: accession, name, type, mature/hairpin flag
-    df = pd.read_csv(mirbase_file, sep="\t", header=None, dtype=str)
+def parse_mirbase_dat(path: Path) -> dict[str, str]:
+    """
+    Parse a miRBase EMBL-format miRNA.dat file.
+
+    Each entry looks like::
+
+        ID   hsa-mir-21        standard; RNA; HSA; 72 BP.
+        AC   MI0000077;
+        ...
+        FT   miRNA           13..33
+        FT                   /accession="MIMAT0000076"
+        FT                   /product="hsa-miR-21-5p"
+        ...
+
+    Returns ``{UPPERCASE_mature_name → 'MRB:MIMAT<accession>'}``.
+    Both arm-annotated names (``hsa-miR-21-5p``) *and* legacy names without
+    arm designation (``hsa-miR-21``, as found in older releases) are included
+    verbatim from whatever the ``/product`` field contains.
+    """
     mapping: dict[str, str] = {}
+    current_acc = ""
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.rstrip()
+            if line.startswith("FT   miRNA"):
+                current_acc = ""
+            elif line.startswith("FT                   /accession="):
+                m = re.search(r'"(MIMAT\d+)"', line)
+                if m:
+                    current_acc = m.group(1)
+            elif line.startswith("FT                   /product="):
+                m = re.search(r'"([^"]+)"', line)
+                if m and current_acc:
+                    name = m.group(1).strip()
+                    mapping[name.upper()] = f"MRB:{current_acc}"
+                    current_acc = ""
+    logger.debug("parse_mirbase_dat: extracted %d mature entries from %s", len(mapping), path)
+    return mapping
+
+
+def _download_mirbase_dat(release: int, mapping_dir: Path) -> Optional[Path]:
+    """
+    Download miRNA.dat for the given *release* number into *mapping_dir*.
+
+    Tries the gzip-compressed URL first (``miRNA.dat.gz``), then falls back to
+    the plain ``miRNA.dat``.  Returns the local path on success, or ``None`` if
+    the release is unavailable.
+    """
+    dest = mapping_dir / f"mirbase_{release}_miRNA.dat"
+    if dest.exists():
+        logger.info("miRBase release %d dat already present: %s", release, dest)
+        return dest
+
+    url = f"{MIRBASE_DAT_BASE}/{release}/miRNA.dat"
+    try:
+        resp = requests.get(url, timeout=120, stream=True)
+        if resp.status_code == 404:
+            continue
+        resp.raise_for_status()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(resp.content)
+        logger.info(
+            "Downloaded miRBase release %d dat: %s (%d bytes)",
+            release, dest, dest.stat().st_size,
+        )
+        return dest
+    except requests.RequestException:
+        logger.warning("miRBase release %d dat not available; skipping", release)
+        return None
+
+
+def load_mirbase(mirbase_file: Path) -> dict[str, str]:
+    """
+    Build a merged miRNA name → ``'MRB:<accession>'`` lookup.
+
+    Resolution layers (highest → lowest priority; earlier layers win):
+
+    1. **CURRENT id_mapping.tsv** – arm-annotated modern names.
+    2. **Previous-release miRNA.dat files** (releases 22, 21, 20) – includes
+       legacy names without arm designation (e.g. ``hsa-miR-93``) exactly as
+       stored in older ``/product`` fields.
+    3. **Stem-fallback entries** synthesised from (1): for each modern name
+       like ``HSA-MIR-93-5P``, a no-arm entry ``HSA-MIR-93`` is added if one
+       is not already present, preferring ``-5p`` over ``-3p`` when both exist.
+
+    Parameters
+    ----------
+    mirbase_file:
+        Path where the CURRENT id_mapping.tsv is cached (downloaded if absent).
+
+    Returns
+    -------
+    dict[str, str]
+        Keys are **uppercase** miRNA names; values are ``'MRB:<accession>'``.
+    """
+    # ------------------------------------------------------------------ #
+    # Layer 1: CURRENT id_mapping.tsv                                     #
+    # ------------------------------------------------------------------ #
+    download_if_missing(MIRBASE_URL, mirbase_file)
+    logger.info("Loading miRBase CURRENT mapping from %s", mirbase_file)
+    df = pd.read_csv(mirbase_file, sep="\t", header=None, dtype=str)
+    current_map: dict[str, str] = {}
     for _, row in df.iterrows():
         acc = str(row.iloc[0]).strip()
         name = str(row.iloc[1]).strip()
         if acc and name:
-            mapping[name.upper()] = f"MRB:{acc}"
-    logger.info("miRBase: loaded %d name→accession entries", len(mapping))
-    return mapping
+            current_map[name.upper()] = f"MRB:{acc}"
+    logger.info("miRBase CURRENT: %d entries", len(current_map))
+
+    # ------------------------------------------------------------------ #
+    # Layer 2: previous-release miRNA.dat files                           #
+    # ------------------------------------------------------------------ #
+    mapping_dir = mirbase_file.parent
+    dat_map: dict[str, str] = {}
+    for release in MIRBASE_DAT_RELEASES:
+        dat_path = _download_mirbase_dat(release, mapping_dir)
+        if dat_path is None:
+            continue
+        entries = parse_mirbase_dat(dat_path)
+        # setdefault so the newest release (tried first) wins on conflict
+        for key, val in entries.items():
+            dat_map.setdefault(key, val)
+    logger.info("miRBase previous-release dat files: %d entries total", len(dat_map))
+
+    # Merge: CURRENT wins, dat fills in the rest
+    merged: dict[str, str] = {**dat_map, **current_map}
+    logger.info("miRBase merged (CURRENT + dat): %d entries", len(merged))
+
+    # ------------------------------------------------------------------ #
+    # Layer 3: synthesise no-arm stem entries from CURRENT arm names      #
+    # Prefer -5p over -3p; skip if a legacy entry already covers the stem #
+    # ------------------------------------------------------------------ #
+    stem_map: dict[str, str] = {}
+    # Pass 1 – collect -5p arms first (higher preference)
+    for name, acc in current_map.items():
+        if name.endswith("-5P"):
+            stem = re.sub(r"-5P$", "", name)
+            stem_map[stem] = acc
+    # Pass 2 – fill -3p arms only where no entry exists yet
+    for name, acc in current_map.items():
+        if name.endswith("-3P"):
+            stem = re.sub(r"-3P$", "", name)
+            stem_map.setdefault(stem, acc)
+
+    added = 0
+    for stem, acc in stem_map.items():
+        if stem not in merged:
+            merged[stem] = acc
+            added += 1
+    logger.info("miRBase stem-fallback: added %d no-arm entries", added)
+
+    logger.info("miRBase final lookup size: %d entries", len(merged))
+    return merged
 
 
 # ===========================================================================
@@ -501,19 +649,104 @@ def _ols_lookup(condition: str) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# miRBase REST API fallback (Tier 3 for map_mirna_id)
+# ---------------------------------------------------------------------------
+
+_mirbase_rest_cache: dict[str, str] = {}
+
+
+def _mirbase_rest_lookup(mirna_id: str) -> str:
+    """
+    Query the miRBase REST API for a single mature miRNA ID.
+
+    Uses ``GET /api/v1/mature/?format=json&search=<id>``.
+    Performs an exact-name match first; falls back to the first result if no
+    exact match is found.
+
+    Returns ``'MRB:MIMAT<accession>'`` or ``''``.
+    Results are cached in ``_mirbase_rest_cache`` to avoid duplicate requests.
+    """
+    key = mirna_id.strip()
+    if key in _mirbase_rest_cache:
+        return _mirbase_rest_cache[key]
+
+    time.sleep(0.3)  # polite rate-limiting (~3 req/s)
+    try:
+        resp = requests.get(
+            MIRBASE_REST_API,
+            params={"format": "json", "search": key},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        results = resp.json()
+        if isinstance(results, list) and results:
+            # Prefer an exact name match
+            for entry in results:
+                if entry.get("mature_name", "").lower() == key.lower():
+                    acc = entry.get("mature_acc", "")
+                    if acc:
+                        result = f"MRB:{acc}"
+                        _mirbase_rest_cache[key] = result
+                        logger.info("miRBase REST exact: '%s' → %s", key, result)
+                        return result
+            # Fall back to first returned result
+            acc = results[0].get("mature_acc", "")
+            if acc:
+                result = f"MRB:{acc}"
+                _mirbase_rest_cache[key] = result
+                logger.info(
+                    "miRBase REST first-result fallback: '%s' → %s (name='%s')",
+                    key, result, results[0].get("mature_name", ""),
+                )
+                return result
+    except requests.RequestException:
+        logger.exception("miRBase REST lookup failed for '%s'", mirna_id)
+
+    _mirbase_rest_cache[key] = ""
+    return ""
+
+
 def map_mirna_id(
     mirna_id: str,
     mirbase: dict[str, str],
 ) -> str:
-    """Map a miRNA ID to 'MRB:<accession>'."""
+    """
+    Map a miRNA ID to ``'MRB:<accession>'`` using a 3-tier strategy.
+
+    Tier 1 — merged lookup dict
+        Covers CURRENT id_mapping.tsv, previous-release miRNA.dat entries
+        (including old-style names without arm designation such as
+        ``hsa-miR-93``), and synthesised no-arm stem entries.
+
+    Tier 2 — arm-suffix strip
+        If the query already ends in ``-5p`` / ``-3p``, try removing it to
+        match a bare stem that may have been added by the dat parser.
+
+    Tier 3 — miRBase REST API
+        Per-entry network call for IDs still unresolved after the local tables.
+        Results are cached so each distinct ID is only queried once.
+
+    Returns the original *mirna_id* string unchanged if all tiers fail (so the
+    caller can detect the miss via ``not id.startswith("MRB:")`).
+    """
     key = mirna_id.strip().upper()
+
+    # Tier 1: merged dict (TSV + dat files + stem-fallback entries)
     if key in mirbase:
         return mirbase[key]
-    # Try stem-loop (e.g. strip the -5p/-3p suffix)
+
+    # Tier 2: strip -5p / -3p arm suffix and retry
     stem = re.sub(r"[-_][35]P$", "", key)
-    if stem in mirbase:
-        logger.info("miRNA stem-loop fallback: '%s' → '%s'", mirna_id, mirbase[stem])
+    if stem != key and stem in mirbase:
+        logger.info("miRNA arm-strip fallback: '%s' → '%s'", mirna_id, mirbase[stem])
         return mirbase[stem]
+
+    # Tier 3: miRBase REST API
+    result = _mirbase_rest_lookup(mirna_id.strip())
+    if result:
+        return result
+
     logger.warning("miRNA ID not mapped: %s", mirna_id)
     return mirna_id
 
@@ -782,6 +1015,15 @@ def process_metabolite(
     return pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
 
 
+# Species prefixes that are valid for a Homo sapiens row.
+# Virus miRNAs (ebv-, kshv-, etc.) are biologically plausible in saliva but
+# are still flagged so curators can review them; they are NOT dropped.
+_HUMAN_MIRNA_PREFIXES = {"hsa"}
+
+# Species prefixes that should be dropped when the row organism is Homo sapiens.
+_DROP_MIRNA_PREFIXES = {"mmu"}  # mouse – erroneously attributed
+
+
 def process_mirna(
     df: pd.DataFrame,
     mirbase: dict[str, str],
@@ -794,8 +1036,36 @@ def process_mirna(
     df = df[df["Regulation"].str.strip() != "NA"].copy()
 
     rows = []
+    dropped_mmu = 0
     for _, src in df.iterrows():
         sal_id = str(src["SAL_ID"]).split("_")[-1]
+        raw_id = str(src["ID"]).strip()
+        organism = str(src.get("Organism", "")).strip()
+
+        # ------------------------------------------------------------------
+        # Organism / ID-prefix guard
+        # ------------------------------------------------------------------
+        id_prefix = raw_id.split("-")[0].lower() if "-" in raw_id else ""
+
+        if id_prefix in _DROP_MIRNA_PREFIXES:
+            logger.warning(
+                "Dropping row SAL_ID=%s: %s miRNA '%s' erroneously attributed "
+                "to organism '%s'",
+                sal_id, id_prefix.upper(), raw_id, organism,
+            )
+            dropped_mmu += 1
+            continue
+
+        if id_prefix and id_prefix not in _HUMAN_MIRNA_PREFIXES:
+            logger.warning(
+                "Organism mismatch SAL_ID=%s: miRNA '%s' has non-human prefix "
+                "'%s' but row organism is '%s' – keeping row for curator review",
+                sal_id, raw_id, id_prefix, organism,
+            )
+
+        # ------------------------------------------------------------------
+        # Standard row processing
+        # ------------------------------------------------------------------
         condition = clean_condition(str(src["Disease_name"]))
         if condition in ("healthy", "na", ""):
             continue
@@ -814,7 +1084,6 @@ def process_mirna(
         change_type = map_change_type(str(src.get("Regulation", "")))
         aspect_type = "expression"
 
-        raw_id = str(src["ID"]).strip()
         entity_id = map_mirna_id(raw_id, mirbase)
         bvc = build_biomarker_controlled_vocab(
             change_type, aspect_type, entity_name, entity_id
@@ -850,6 +1119,12 @@ def process_mirna(
                     }
                 )
 
+    if dropped_mmu:
+        logger.warning(
+            "process_mirna: dropped %d row(s) with mmu- prefix (mouse miRNA in "
+            "Homo sapiens rows)",
+            dropped_mmu,
+        )
     logger.info("mirna.tsv produced %d output rows", len(rows))
     return pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
 
