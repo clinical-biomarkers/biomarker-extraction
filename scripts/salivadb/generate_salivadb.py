@@ -376,85 +376,57 @@ def load_mirbase(mirbase_file: Path) -> dict[str, str]:
 
 _ncbi_gene_cache: dict[str, str] = {}
 
-
 def _ncbi_gene_lookup(symbol: str, api_key: str = "") -> str:
-    """
-    Query NCBI Gene for *symbol* (Homo sapiens) and return its HGNC ID string
-    (e.g. ``'HGNC:5'``), or ``''`` if not found.
-
-    Results are cached in ``_ncbi_gene_cache`` to avoid redundant API calls.
-    NCBI allows 3 req/s without an API key; we sleep 0.34 s between the two
-    calls to stay within that limit.  Pass an API key to raise the limit to
-    10 req/s and skip the sleep.
-    """
     key = symbol.strip().upper()
     if key in _ncbi_gene_cache:
         return _ncbi_gene_cache[key]
 
     params_base = {"api_key": api_key} if api_key else {}
+    # Stay under NCBI's rate limit: 10 req/s with key, 3 req/s without.
+    base_delay = 0.11 if api_key else 0.4
 
-    try:
-        # --- Step 1: esearch → Gene ID ---
-        resp = requests.get(
-            NCBI_ESEARCH_URL,
-            params={
-                **params_base,
-                "db": "gene",
-                "term": f'{key}[sym] AND "Homo sapiens"[Organism]',
-                "retmode": "json",
-                "retmax": 1,
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        ids = resp.json().get("esearchresult", {}).get("idlist", [])
-        if not ids:
-            logger.warning("NCBI Gene: no result for symbol '%s'", symbol)
+    for attempt in range(4):  # initial attempt + up to 3 retries
+        sleep_time = base_delay if attempt == 0 else base_delay * (2 ** attempt)
+        time.sleep(sleep_time)
+        try:
+            resp = requests.get(
+                NCBI_ESEARCH_URL,
+                params={
+                    **params_base,
+                    "db": "gene",
+                    "term": f'{key}[sym] AND "Homo sapiens"[Organism]',
+                    "retmode": "json",
+                    "retmax": 1,
+                },
+                timeout=30,
+            )
+            if resp.status_code == 429:
+                logger.warning(
+                    "NCBI 429 for '%s'; backing off %.1fs (attempt %d/4)",
+                    symbol, sleep_time * 2, attempt + 1,
+                )
+                continue  # sleep is doubled on the next iteration
+            resp.raise_for_status()
+
+            ids = resp.json().get("esearchresult", {}).get("idlist", [])
+            if not ids:
+                logger.warning("NCBI Gene: no result for symbol '%s'", symbol)
+                _ncbi_gene_cache[key] = ""
+                return ""
+
+            ncbi_id = f"NCBI:{ids[0]}"
+            logger.info("NCBI Gene fallback: '%s' → %s", symbol, ncbi_id)
+            _ncbi_gene_cache[key] = ncbi_id
+            return ncbi_id
+
+        except requests.RequestException:
+            logger.exception("NCBI Gene lookup failed for '%s'", symbol)
             _ncbi_gene_cache[key] = ""
             return ""
 
-        gene_id = ids[0]
-        if not api_key:
-            time.sleep(0.34)  # stay within 3 req/s rate limit
-
-        # --- Step 2: efetch XML → HGNC xref ---
-        resp = requests.get(
-            NCBI_EFETCH_URL,
-            params={
-                **params_base,
-                "db": "gene",
-                "id": gene_id,
-                "retmode": "xml",
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-
-        root = ET.fromstring(resp.content)
-        # HGNC xref lives in Gene-ref/Gene-ref_db/Dbtag nodes
-        for dbtag in root.iter("Dbtag"):
-            db_el = dbtag.find("Dbtag_db")
-            if db_el is not None and db_el.text == "HGNC":
-                tag_el = dbtag.find("Dbtag_tag/Object-id/Object-id_id")
-                if tag_el is not None and tag_el.text:
-                    hgnc_id = f"HGNC:{tag_el.text}"
-                    logger.info(
-                        "NCBI Gene fallback: '%s' (Gene ID %s) → %s",
-                        symbol, gene_id, hgnc_id,
-                    )
-                    _ncbi_gene_cache[key] = hgnc_id
-                    return hgnc_id
-
-        logger.warning(
-            "NCBI Gene: no HGNC xref for symbol '%s' (Gene ID %s)", symbol, gene_id
-        )
-
-    except (requests.RequestException, ET.ParseError):
-        logger.exception("NCBI Gene lookup failed for '%s'", symbol)
-
+    logger.error("NCBI Gene: exhausted retries for '%s'; dropping", symbol)
     _ncbi_gene_cache[key] = ""
     return ""
-
 
 def map_gene_symbol(
     symbol: str,
@@ -657,55 +629,25 @@ def process_gene(
         if is_fusion:
             change_type = "presence of"
             aspect_type = "sequence variation"
-            # Skip regulation==NA check for fusions
-            regulation_ok = True
+            # Strip the " fusion" annotation before splitting
+            fusion_id = re.sub(r'\s+fusion\b.*', '', raw_id, flags=re.IGNORECASE).strip()
+            m = re.match(r'^([A-Za-z]+[0-9]+)([A-Za-z]+[0-9]+)$', fusion_id)
+            if m:
+                gene_a_sym = m.group(1)
+                gene_b_raw = m.group(2)
+            else:
+                mid = len(fusion_id) // 2
+                gene_a_sym = fusion_id[:mid]
+                gene_b_raw = fusion_id[mid:]
+            gene_names = [gene_a_sym, gene_b_raw]
+            gene_ids = [map_gene_symbol(gene_a_sym, hgnc, ncbi_api_key),
+                        map_gene_symbol(gene_b_raw, hgnc, ncbi_api_key)]
+            entity_indices = [1, 2]
         else:
             if str(src.get("Regulation", "")).strip() == "NA":
                 continue
             change_type = map_change_type(str(src.get("Regulation", "")))
             aspect_type = "expression"
-            regulation_ok = True
-
-        if not regulation_ok:
-            continue
-
-        condition = clean_condition(str(src["Disease_name"]))
-        if condition in ("healthy", "na", ""):
-            continue
-
-        condition_tuples = resolve_condition(condition, curated, doid)
-        if not condition_tuples:
-            continue
-
-        specimen = map_specimen(str(src.get("Collection_site", "")))
-        specimen_id = SPECIMEN_ID_MAP.get(specimen, "")
-        evidence_source = parse_evidence_source(str(src.get("PMID", "")))
-        if evidence_source is None:
-            continue
-        entity_type = str(src.get("Biomarker", "")).strip().lower()
-        base_name = clean_biomarker_name(str(src["Biomarker_Name"]))
-
-        if is_fusion:
-            # Split fusion: gene A is first N chars before last all-uppercase run
-            # We follow the regex: everything up to the second uppercase block
-            m = re.match(
-                r"^([A-Za-z0-9]+?)([A-Z0-9]{3,}[0-9](\s+\S+)?)$", raw_id
-            )
-            if m:
-                gene_a_sym = m.group(1)
-                gene_b_raw = m.group(2).split()[0]
-            else:
-                # fallback: split at midpoint
-                mid = len(raw_id) // 2
-                gene_a_sym = raw_id[:mid]
-                gene_b_raw = raw_id[mid:]
-
-            id_a = map_gene_symbol(gene_a_sym, hgnc, ncbi_api_key)
-            id_b = map_gene_symbol(gene_b_raw, hgnc, ncbi_api_key)
-            gene_names = [gene_a_sym, gene_b_raw]
-            gene_ids = [id_a, id_b]
-            entity_indices = [1, 2]
-        else:
             gene_names = [base_name]
             gene_ids = [map_gene_symbol(raw_id, hgnc, ncbi_api_key)]
             entity_indices = [1]
@@ -1059,7 +1001,15 @@ def main() -> None:
     ]
 
     result = pd.concat(frames, ignore_index=True)
-    logger.info("Total output rows: %d", len(result))
+    logger.info("Total output rows before ID filter: %d", len(result))
+
+    before = len(result)
+    result = result[result["assessed_biomarker_entity_id"] != ""].copy()
+    logger.info(
+        "Dropped %d rows with empty assessed_biomarker_entity_id; keeping %d",
+        before - len(result),
+        len(result),
+    )
 
     # ------------------------------------------------------------------
     # Write output
