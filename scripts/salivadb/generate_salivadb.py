@@ -47,10 +47,8 @@ MIRBASE_URL = "https://mirbase.org/download/CURRENT/id_mapping.tsv"
 MIRBASE_DAT_RELEASES = [22, 21, 20]
 MIRBASE_DAT_BASE = "https://mirbase.org/download_version_files"
 
-# miRBase REST API for per-entry fallback (Tier 3).
-MIRBASE_REST_API = "https://mirbase.org/api/v1/mature/"
-
 OLS_API = "https://www.ebi.ac.uk/ols4/api/search"
+RNACENTRAL_API = "https://rnacentral.org/api/v1/rna/"
 
 NCBI_ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 NCBI_EFETCH_URL  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
@@ -420,7 +418,7 @@ def _download_mirbase_dat(release: int, mapping_dir: Path) -> Optional[Path]:
     try:
         resp = requests.get(url, timeout=120, stream=True)
         if resp.status_code == 404:
-            continue
+            return None
         resp.raise_for_status()
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(resp.content)
@@ -650,60 +648,88 @@ def _ols_lookup(condition: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# miRBase REST API fallback (Tier 3 for map_mirna_id)
+# RNACentral API fallback (Tier 3 for map_mirna_id)
 # ---------------------------------------------------------------------------
 
-_mirbase_rest_cache: dict[str, str] = {}
+_rnacentral_cache: dict[str, str] = {}
 
 
-def _mirbase_rest_lookup(mirna_id: str) -> str:
+def _rnacentral_lookup(mirna_id: str) -> str:
     """
-    Query the miRBase REST API for a single mature miRNA ID.
+    Query the RNACentral REST API for a mature miRNA name.
 
-    Uses ``GET /api/v1/mature/?format=json&search=<id>``.
-    Performs an exact-name match first; falls back to the first result if no
-    exact match is found.
+    Strategy
+    --------
+    1. ``GET /api/v1/rna/?external_id=<id>`` to find the entry whose external
+       ID matches the query name (covers both arm-annotated and legacy names
+       registered in RNACentral from miRBase or other sources).
+    2. Follow the ``xrefs`` link on the first matching result, filtered to
+       ``database=MIRBASE``, and extract the MIMAT accession.
+    3. If a MIMAT accession is found, return ``'MRB:MIMAT<accession>'``.
+    4. If no MIMAT xref is available but a RNACentral URS ID is found, return
+       ``'RNAcentral:<URS>'`` as a fallback identifier.
 
-    Returns ``'MRB:MIMAT<accession>'`` or ``''``.
-    Results are cached in ``_mirbase_rest_cache`` to avoid duplicate requests.
+    Returns ``'MRB:MIMAT<accession>'``, ``'RNAcentral:<URS>'``, or ``''``.
+    Results are cached in ``_rnacentral_cache`` to avoid duplicate requests.
     """
     key = mirna_id.strip()
-    if key in _mirbase_rest_cache:
-        return _mirbase_rest_cache[key]
+    if key in _rnacentral_cache:
+        return _rnacentral_cache[key]
 
-    time.sleep(0.3)  # polite rate-limiting (~3 req/s)
+    time.sleep(0.3)  # polite rate-limiting
     try:
         resp = requests.get(
-            MIRBASE_REST_API,
-            params={"format": "json", "search": key},
+            RNACENTRAL_API,
+            params={"format": "json", "external_id": key},
             timeout=30,
         )
         resp.raise_for_status()
-        results = resp.json()
-        if isinstance(results, list) and results:
-            # Prefer an exact name match
-            for entry in results:
-                if entry.get("mature_name", "").lower() == key.lower():
-                    acc = entry.get("mature_acc", "")
-                    if acc:
-                        result = f"MRB:{acc}"
-                        _mirbase_rest_cache[key] = result
-                        logger.info("miRBase REST exact: '%s' → %s", key, result)
-                        return result
-            # Fall back to first returned result
-            acc = results[0].get("mature_acc", "")
-            if acc:
-                result = f"MRB:{acc}"
-                _mirbase_rest_cache[key] = result
-                logger.info(
-                    "miRBase REST first-result fallback: '%s' → %s (name='%s')",
-                    key, result, results[0].get("mature_name", ""),
-                )
-                return result
-    except requests.RequestException:
-        logger.exception("miRBase REST lookup failed for '%s'", mirna_id)
+        results = resp.json().get("results", [])
 
-    _mirbase_rest_cache[key] = ""
+        if not results:
+            logger.warning("RNACentral: no results for '%s'", mirna_id)
+            _rnacentral_cache[key] = ""
+            return ""
+
+        # Prefer an entry whose description contains the query name exactly
+        entry = results[0]
+        for r in results:
+            if key.lower() in r.get("description", "").lower():
+                entry = r
+                break
+
+        # Follow xrefs link to retrieve the MIRBASE MIMAT accession
+        xrefs_url = entry.get("xrefs", "")
+        if xrefs_url:
+            time.sleep(0.3)
+            xr_resp = requests.get(
+                xrefs_url,
+                params={"format": "json", "database": "MIRBASE", "page_size": 20},
+                timeout=30,
+            )
+            xr_resp.raise_for_status()
+            for xref in xr_resp.json().get("results", []):
+                ext_id = xref.get("accession", {}).get("external_id", "")
+                if ext_id.startswith("MIMAT"):
+                    result = f"MRB:{ext_id}"
+                    _rnacentral_cache[key] = result
+                    logger.info("RNACentral: '%s' → %s", mirna_id, result)
+                    return result
+
+        # No MIMAT found – fall back to RNACentral URS identifier
+        urs = entry.get("rnacentral_id", "")
+        if urs:
+            result = f"RNAcentral:{urs}"
+            _rnacentral_cache[key] = result
+            logger.info(
+                "RNACentral (no MIMAT xref): '%s' → %s", mirna_id, result
+            )
+            return result
+
+    except requests.RequestException:
+        logger.exception("RNACentral lookup failed for '%s'", mirna_id)
+
+    _rnacentral_cache[key] = ""
     return ""
 
 
@@ -723,12 +749,15 @@ def map_mirna_id(
         If the query already ends in ``-5p`` / ``-3p``, try removing it to
         match a bare stem that may have been added by the dat parser.
 
-    Tier 3 — miRBase REST API
+    Tier 3 — RNACentral REST API
         Per-entry network call for IDs still unresolved after the local tables.
-        Results are cached so each distinct ID is only queried once.
+        Searches RNACentral by external ID, then resolves to a miRBase MIMAT
+        accession via cross-references.  Falls back to a RNACentral URS
+        identifier if no MIMAT xref is available.  Results are cached so each
+        distinct ID is only queried once.
 
     Returns the original *mirna_id* string unchanged if all tiers fail (so the
-    caller can detect the miss via ``not id.startswith("MRB:")`).
+    caller can detect the miss via ``not id.startswith(("MRB:", "RNAcentral:"))``.
     """
     key = mirna_id.strip().upper()
 
@@ -742,8 +771,8 @@ def map_mirna_id(
         logger.info("miRNA arm-strip fallback: '%s' → '%s'", mirna_id, mirbase[stem])
         return mirbase[stem]
 
-    # Tier 3: miRBase REST API
-    result = _mirbase_rest_lookup(mirna_id.strip())
+    # Tier 3: RNACentral REST API
+    result = _rnacentral_lookup(mirna_id.strip())
     if result:
         return result
 
