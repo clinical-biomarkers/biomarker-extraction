@@ -73,4 +73,5 @@ cd scripts/salivadb
 ### generate_salivadb.py
 
 See documentation here: https://github.com/clinical-biomarkers/biomarker-extraction/blob/main/scripts/salivadb/README.md
+
 ---
