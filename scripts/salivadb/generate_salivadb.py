@@ -717,6 +717,88 @@ def map_mirna_id(
 
 
 # ===========================================================================
+# miRNA mapping coverage stats
+# ===========================================================================
+
+
+def _log_mirna_mapping_stats(df: pd.DataFrame, mirbase: dict[str, str]) -> None:
+    """
+    Log a coverage summary for all unique miRNA IDs present in *df* (the full
+    mirna.tsv before any row-level filtering).
+
+    Four mutually-exclusive buckets are reported:
+
+    mapped
+        The ID (or its arm-stripped stem) resolves to an ``MRB:`` accession.
+    missing_suffix
+        The ID is not in miRBase as-is, but appending ``-1`` or ``-2`` would
+        resolve it.  This catches precursor names like ``hsa-mir-19b`` that
+        exist in miRBase only as ``hsa-mir-19b-1`` / ``hsa-mir-19b-2``.
+    other_unmapped
+        The ID cannot be resolved by any strategy and has no ``-1``/``-2``
+        variant in miRBase either.
+    """
+    raw_ids: list[str] = (
+        df["ID"]
+        .dropna()
+        .str.strip()
+        .unique()
+        .tolist()
+    )
+    raw_ids = [rid for rid in raw_ids if rid]
+
+    total = len(raw_ids)
+    mapped: list[str] = []
+    missing_suffix: list[str] = []
+    other_unmapped: list[str] = []
+
+    for raw_id in raw_ids:
+        key = raw_id.strip().upper()
+
+        # --- Tier 1: direct lookup ---
+        if key in mirbase:
+            mapped.append(raw_id)
+            continue
+
+        # --- Tier 2: arm-suffix strip (-5p / -3p) ---
+        stem = re.sub(r"[-_][35]P$", "", key)
+        if stem != key and stem in mirbase:
+            mapped.append(raw_id)
+            continue
+
+        # --- Not mapped; check whether adding -1 / -2 would work ---
+        if (
+            f"{key}-1" in mirbase or f"{key}-2" in mirbase
+            or f"{key}A" in mirbase or f"{key}B" in mirbase
+        ):
+            missing_suffix.append(raw_id)
+        else:
+            other_unmapped.append(raw_id)
+
+    logger.info(
+        "miRNA mapping coverage (unique IDs in mirna.tsv): "
+        "%d total | %d mapped to miRBase | %d missing -1/-2 suffix | "
+        "%d other unmapped",
+        total,
+        len(mapped),
+        len(missing_suffix),
+        len(other_unmapped),
+    )
+    if missing_suffix:
+        logger.info(
+            "miRNA IDs unmapped due to missing -1/-2 suffix (%d): %s",
+            len(missing_suffix),
+            ", ".join(sorted(missing_suffix)),
+        )
+    if other_unmapped:
+        logger.info(
+            "miRNA IDs unmapped for other reasons (%d): %s",
+            len(other_unmapped),
+            ", ".join(sorted(other_unmapped)),
+        )
+
+
+# ===========================================================================
 # Field transformation helpers
 # ===========================================================================
 
@@ -996,6 +1078,13 @@ def process_mirna(
     curated: CuratedMappings,
 ) -> pd.DataFrame:
     logger.info("Processing mirna.tsv (%d rows before filtering)", len(df))
+
+    # ------------------------------------------------------------------
+    # Mapping coverage stats (computed from the full, unfiltered dataframe
+    # so the numbers reflect the complete contents of mirna.tsv)
+    # ------------------------------------------------------------------
+    _log_mirna_mapping_stats(df, mirbase)
+
     df = df[df["Organism"].str.strip() == "Homo sapiens"].copy()
     df = df[~df["Disease_name"].str.strip().isin(["Healthy", "NA"])].copy()
     df = df[df["Regulation"].str.strip() != "NA"].copy()
