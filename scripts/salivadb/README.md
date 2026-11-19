@@ -41,7 +41,7 @@ python generate_salivadb.py \
   --ncbi-api-key "$NCBI_API_KEY"
 ```
 
-The script will auto-download any missing mapping files (HGNC, DOID, miRBase) on first run, so an internet connection is required unless all mapping files are pre-cached in `--mapping-dir`.
+The script will auto-download any missing mapping files (HGNC, DOID, miRBase) on first run, so an internet connection is required unless all mapping files are pre-cached in `--mapping-dir`. If they are pre-cached, the run time is <5 min.
 
 ---
 
