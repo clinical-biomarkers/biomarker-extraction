@@ -48,7 +48,6 @@ MIRBASE_DAT_RELEASES = [22, 21, 20]
 MIRBASE_DAT_BASE = "https://mirbase.org/download_version_files"
 
 OLS_API = "https://www.ebi.ac.uk/ols4/api/search"
-RNACENTRAL_API = "https://rnacentral.org/api/v1/rna/"
 
 NCBI_ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 NCBI_EFETCH_URL  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
@@ -375,17 +374,51 @@ def parse_mirbase_dat(path: Path) -> dict[str, str]:
         FT                   /product="hsa-miR-21-5p"
         ...
 
-    Returns ``{UPPERCASE_mature_name → 'MRB:MIMAT<accession>'}``.
-    Both arm-annotated names (``hsa-miR-21-5p``) *and* legacy names without
-    arm designation (``hsa-miR-21``, as found in older releases) are included
-    verbatim from whatever the ``/product`` field contains.
+    Two kinds of entries are extracted and merged into one dict:
+
+    **Precursor entries** (from ``ID`` / ``AC`` lines)
+        The lowercase precursor name on the ``ID`` line (e.g. ``hsa-mir-21``)
+        is paired with the ``MI…`` accession on the ``AC`` line and stored as
+        ``UPPERCASE_name → 'MRB:MI<accession>'``.  These are added with
+        ``setdefault`` so that a mature entry for the same uppercased key
+        (written via direct assignment further below) always wins.
+
+    **Mature entries** (from ``FT`` feature blocks)
+        The mature name from ``/product`` (e.g. ``hsa-miR-21-5p``) is paired
+        with the ``MIMAT…`` accession from ``/accession`` and stored as
+        ``UPPERCASE_name → 'MRB:MIMAT<accession>'``.  Both arm-annotated names
+        and legacy names without arm designation are captured verbatim from
+        whatever the ``/product`` field contains.  Direct assignment is used so
+        mature MIMAT entries take priority over any precursor MI entry that
+        shares the same uppercased key.
+
+    Returns a combined ``{UPPERCASE_name → 'MRB:<accession>'}`` dict.
     """
     mapping: dict[str, str] = {}
     current_acc = ""
+    current_id_name = ""
     with open(path, encoding="utf-8") as fh:
         for line in fh:
             line = line.rstrip()
-            if line.startswith("FT   miRNA"):
+            # ----------------------------------------------------------
+            # Precursor name from the record header
+            # ----------------------------------------------------------
+            if line.startswith("ID   "):
+                m = re.match(r"ID\s+(\S+)", line)
+                if m:
+                    current_id_name = m.group(1)
+            # ----------------------------------------------------------
+            # Precursor accession (MI…) – store as soon as both ID and
+            # AC are known; setdefault keeps mature MIMAT entries intact
+            # ----------------------------------------------------------
+            elif line.startswith("AC   "):
+                m = re.search(r"(MI\d+)", line)
+                if m and current_id_name:
+                    mapping.setdefault(current_id_name.upper(), f"MRB:{m.group(1)}")
+            # ----------------------------------------------------------
+            # Mature entries from FT feature blocks
+            # ----------------------------------------------------------
+            elif line.startswith("FT   miRNA"):
                 current_acc = ""
             elif line.startswith("FT                   /accession="):
                 m = re.search(r'"(MIMAT\d+)"', line)
@@ -397,7 +430,7 @@ def parse_mirbase_dat(path: Path) -> dict[str, str]:
                     name = m.group(1).strip()
                     mapping[name.upper()] = f"MRB:{current_acc}"
                     current_acc = ""
-    logger.debug("parse_mirbase_dat: extracted %d mature entries from %s", len(mapping), path)
+    logger.debug("parse_mirbase_dat: extracted %d entries from %s", len(mapping), path)
     return mapping
 
 
@@ -441,7 +474,8 @@ def load_mirbase(mirbase_file: Path) -> dict[str, str]:
     1. **CURRENT id_mapping.tsv** – arm-annotated modern names.
     2. **Previous-release miRNA.dat files** (releases 22, 21, 20) – includes
        legacy names without arm designation (e.g. ``hsa-miR-93``) exactly as
-       stored in older ``/product`` fields.
+       stored in older ``/product`` fields, plus precursor names (e.g.
+       ``hsa-mir-93``) from ``ID``/``AC`` lines.
     3. **Stem-fallback entries** synthesised from (1): for each modern name
        like ``HSA-MIR-93-5P``, a no-arm entry ``HSA-MIR-93`` is added if one
        is not already present, preferring ``-5p`` over ``-3p`` when both exist.
@@ -647,117 +681,24 @@ def _ols_lookup(condition: str) -> str:
     return ""
 
 
-# ---------------------------------------------------------------------------
-# RNACentral API fallback (Tier 3 for map_mirna_id)
-# ---------------------------------------------------------------------------
-
-_rnacentral_cache: dict[str, str] = {}
-
-
-def _rnacentral_lookup(mirna_id: str) -> str:
-    """
-    Query the RNACentral REST API for a mature miRNA name.
-
-    Strategy
-    --------
-    1. ``GET /api/v1/rna/?external_id=<id>`` to find the entry whose external
-       ID matches the query name (covers both arm-annotated and legacy names
-       registered in RNACentral from miRBase or other sources).
-    2. Follow the ``xrefs`` link on the first matching result, filtered to
-       ``database=MIRBASE``, and extract the MIMAT accession.
-    3. If a MIMAT accession is found, return ``'MRB:MIMAT<accession>'``.
-    4. If no MIMAT xref is available but a RNACentral URS ID is found, return
-       ``'RNAcentral:<URS>'`` as a fallback identifier.
-
-    Returns ``'MRB:MIMAT<accession>'``, ``'RNAcentral:<URS>'``, or ``''``.
-    Results are cached in ``_rnacentral_cache`` to avoid duplicate requests.
-    """
-    key = mirna_id.strip()
-    if key in _rnacentral_cache:
-        return _rnacentral_cache[key]
-
-    time.sleep(0.3)  # polite rate-limiting
-    try:
-        resp = requests.get(
-            RNACENTRAL_API,
-            params={"format": "json", "external_id": key},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        results = resp.json().get("results", [])
-
-        if not results:
-            logger.warning("RNACentral: no results for '%s'", mirna_id)
-            _rnacentral_cache[key] = ""
-            return ""
-
-        # Prefer an entry whose description contains the query name exactly
-        entry = results[0]
-        for r in results:
-            if key.lower() in r.get("description", "").lower():
-                entry = r
-                break
-
-        # Follow xrefs link to retrieve the MIRBASE MIMAT accession
-        xrefs_url = entry.get("xrefs", "")
-        if xrefs_url:
-            time.sleep(0.3)
-            xr_resp = requests.get(
-                xrefs_url,
-                params={"format": "json", "database": "MIRBASE", "page_size": 20},
-                timeout=30,
-            )
-            xr_resp.raise_for_status()
-            for xref in xr_resp.json().get("results", []):
-                ext_id = xref.get("accession", {}).get("external_id", "")
-                if ext_id.startswith("MIMAT"):
-                    result = f"MRB:{ext_id}"
-                    _rnacentral_cache[key] = result
-                    logger.info("RNACentral: '%s' → %s", mirna_id, result)
-                    return result
-
-        # No MIMAT found – fall back to RNACentral URS identifier
-        urs = entry.get("rnacentral_id", "")
-        if urs:
-            result = f"RNAcentral:{urs}"
-            _rnacentral_cache[key] = result
-            logger.info(
-                "RNACentral (no MIMAT xref): '%s' → %s", mirna_id, result
-            )
-            return result
-
-    except requests.RequestException:
-        logger.exception("RNACentral lookup failed for '%s'", mirna_id)
-
-    _rnacentral_cache[key] = ""
-    return ""
-
-
 def map_mirna_id(
     mirna_id: str,
     mirbase: dict[str, str],
 ) -> str:
     """
-    Map a miRNA ID to ``'MRB:<accession>'`` using a 3-tier strategy.
+    Map a miRNA ID to ``'MRB:<accession>'`` using a 2-tier strategy.
 
     Tier 1 — merged lookup dict
         Covers CURRENT id_mapping.tsv, previous-release miRNA.dat entries
         (including old-style names without arm designation such as
-        ``hsa-miR-93``), and synthesised no-arm stem entries.
+        ``hsa-miR-93``, and precursor names such as ``hsa-mir-93``), and
+        synthesised no-arm stem entries.
 
     Tier 2 — arm-suffix strip
         If the query already ends in ``-5p`` / ``-3p``, try removing it to
         match a bare stem that may have been added by the dat parser.
 
-    Tier 3 — RNACentral REST API
-        Per-entry network call for IDs still unresolved after the local tables.
-        Searches RNACentral by external ID, then resolves to a miRBase MIMAT
-        accession via cross-references.  Falls back to a RNACentral URS
-        identifier if no MIMAT xref is available.  Results are cached so each
-        distinct ID is only queried once.
-
-    Returns the original *mirna_id* string unchanged if all tiers fail (so the
-    caller can detect the miss via ``not id.startswith(("MRB:", "RNAcentral:"))``.
+    Returns the original *mirna_id* string unchanged if all tiers fail.
     """
     key = mirna_id.strip().upper()
 
@@ -770,11 +711,6 @@ def map_mirna_id(
     if stem != key and stem in mirbase:
         logger.info("miRNA arm-strip fallback: '%s' → '%s'", mirna_id, mirbase[stem])
         return mirbase[stem]
-
-    # Tier 3: RNACentral REST API
-    result = _rnacentral_lookup(mirna_id.strip())
-    if result:
-        return result
 
     logger.warning("miRNA ID not mapped: %s", mirna_id)
     return mirna_id
