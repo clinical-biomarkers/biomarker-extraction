@@ -1,8 +1,8 @@
-# `generate_salivadb.py` — Documentation
+# `generate_salivadb.py`
 
 ## Overview
 
-`generate_salivadb.py` is the primary extraction and harmonisation script for the **SalivaDB** project. It reads four raw TSV files exported from the SalivaDB source database (genes, metabolites, miRNAs, and proteins), maps every entity to a controlled vocabulary identifier, resolves disease names to Disease Ontology (DOID) terms, and writes a single harmonised biomarker table in TSV format suitable for downstream ingestion into the biomarker knowledge graph.
+`generate_salivadb.py` is the primary extraction and harmonisation script for the **SalivaDB** data. It reads four raw TSV files downloaded from the SalivaDB source database (genes, metabolites, miRNAs, and proteins), maps every entity to a controlled vocabulary identifier, resolves disease names to Disease Ontology (DOID), MONDO, or SNOMED terms, and writes a single harmonised biomarker table in TSV format suitable for downstream ingestion into BiomarkerKB.
 
 ---
 
